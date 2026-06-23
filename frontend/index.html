@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#0b0f14" />
+<title>SLAM Robot</title>
+<style>
+  :root{ --bg:#0b0f14; --bg2:#11161d; --panel:#161c25; --line:#252e3a; --txt:#e6edf3; --mut:#8b97a6;
+         --accent:#3d8bfd; --ok:#34d399; --warn:#fbbf24; --bad:#ff5d5d; --mono:ui-monospace,Menlo,Consolas,monospace; }
+  *{ box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body{ margin:0; background:var(--bg); color:var(--txt); font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif; }
+  .top{ display:flex; align-items:center; gap:10px; padding:12px 16px; background:var(--bg2); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:5; }
+  .top b{ font-size:16px; } .top small{ color:var(--mut); font-size:11px; display:block; }
+  .sp{ flex:1; }
+  .pill{ font-family:var(--mono); font-size:12px; padding:4px 10px; border-radius:999px; background:var(--panel); border:1px solid var(--line); }
+  .pill.on{ color:var(--ok); border-color:#1f6b3c; } .pill.off{ color:var(--bad); border-color:#5a2326; }
+  .tabs{ display:flex; background:var(--bg2); border-bottom:1px solid var(--line); }
+  .tabs button{ flex:1; background:none; border:none; color:var(--mut); padding:12px 0; font-size:14px; border-bottom:2px solid transparent; }
+  .tabs button.active{ color:var(--accent); border-bottom-color:var(--accent); }
+  .view{ display:none; padding:14px; } .view.active{ display:block; }
+  .mapWrap{ position:relative; max-width:680px; margin:0 auto; }
+  canvas.map{ width:100%; height:auto; background:#3a4047; border:1px solid var(--line); border-radius:10px; touch-action:none; display:block; }
+  .btn{ padding:11px 16px; margin:4px; border:none; border-radius:9px; background:#222b36; color:#fff; font-size:14px; cursor:pointer; }
+  .btn:active{ background:var(--accent); } .btn.bad{ background:#7f1d1d; } .btn.on{ background:#15803d; } .btn.warn{ background:#854d0e; }
+  .row{ display:flex; flex-wrap:wrap; align-items:center; gap:6px; justify-content:center; }
+  .pad{ text-align:center; margin-top:10px; }
+  .pad .btn{ min-width:64px; font-size:18px; }
+  .card{ background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 14px; margin:10px auto; max-width:680px; }
+  .card h3{ margin:0 0 10px; font-size:13px; color:var(--mut); text-transform:uppercase; letter-spacing:.6px; }
+  input[type=range]{ width:100%; }
+  .slabel{ display:flex; justify-content:space-between; font-size:13px; color:var(--mut); }
+  .list{ max-width:680px; margin:0 auto; }
+  .item{ display:flex; align-items:center; gap:10px; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin-bottom:8px; }
+  .item .meta{ flex:1; font-size:14px; } .item .meta small{ display:block; color:var(--mut); font-family:var(--mono); font-size:12px; }
+  .telg{ display:flex; gap:8px; flex-wrap:wrap; justify-content:center; margin-top:8px; }
+  .empty{ color:var(--mut); text-align:center; padding:30px; }
+</style>
+</head>
+<body>
+  <div class="top">
+    <div><b>SLAM Robot</b><small>điều khiển · xem lại · kho map</small></div>
+    <div class="sp"></div>
+    <div class="pill off" id="robotPill">Robot: offline</div>
+  </div>
+  <div class="tabs">
+    <button class="active" data-t="live">Trực tiếp</button>
+    <button data-t="replay">Xem lại</button>
+    <button data-t="maps">Kho map</button>
+  </div>
+
+  <!-- ============ TRỰC TIẾP ============ -->
+  <div class="view active" id="live">
+    <div class="mapWrap"><canvas class="map" id="liveCanvas" width="680" height="560"></canvas></div>
+    <div class="telg">
+      <span class="pill" id="tDist">-- cm</span>
+      <span class="pill" id="tMove">--</span>
+      <span class="pill" id="tSafe">SAFE</span>
+      <span class="pill" id="tMode">MANUAL</span>
+    </div>
+    <div class="pad">
+      <button class="btn" id="autoBtn">🤖 AUTO: OFF</button>
+      <div id="dpad">
+        <div><button class="btn" data-d="f">▲</button></div>
+        <div class="row">
+          <button class="btn" data-d="l">◀</button>
+          <button class="btn bad" data-d="s">■</button>
+          <button class="btn" data-d="r">▶</button>
+        </div>
+        <div><button class="btn" data-d="b">▼</button></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="slabel"><span>Tốc độ</span><b id="spdVal">200</b></div>
+      <input type="range" min="80" max="255" value="200" id="spd">
+      <div class="slabel" style="margin-top:8px;"><span>Trim (cân bằng)</span><b id="trimVal">0</b></div>
+      <input type="range" min="-80" max="80" value="0" id="trim">
+    </div>
+    <div class="row"><button class="btn" id="liveSaveMap">💾 Lưu map hiện tại</button>
+      <button class="btn bad" id="liveClear">Xóa map</button></div>
+  </div>
+
+  <!-- ============ XEM LẠI ============ -->
+  <div class="view" id="replay">
+    <div class="mapWrap"><canvas class="map" id="replayCanvas" width="680" height="560"></canvas></div>
+    <div class="row" style="margin-top:8px;">
+      <button class="btn" id="rpPlay">▶ Phát</button>
+      <span class="pill" id="rpTime">0.0s</span>
+    </div>
+    <input type="range" min="0" max="100" value="0" id="rpSeek" style="max-width:680px; display:block; margin:10px auto;">
+    <div class="row"><span style="color:var(--mut);font-size:13px;">Tốc độ phát:</span>
+      <button class="btn" data-spd="1">1x</button>
+      <button class="btn" data-spd="2">2x</button>
+      <button class="btn" data-spd="4">4x</button>
+    </div>
+    <div class="card"><h3>Các phiên đã ghi</h3><div class="list" id="sesList"><div class="empty">Đang tải…</div></div></div>
+  </div>
+
+  <!-- ============ KHO MAP ============ -->
+  <div class="view" id="maps">
+    <div class="mapWrap"><canvas class="map" id="mapCanvas" width="680" height="560"></canvas></div>
+    <div class="card"><h3>Kho bản đồ</h3>
+      <div class="list" id="mapList"><div class="empty">Đang tải…</div></div>
+    </div>
+  </div>
+
+<script>
+"use strict";
+const PX_PER_CM = 1.5, CELL = 5, L_OCC=0.9, L_FREE=-0.35, L_MIN=-4, L_MAX=4;
+
+// ---------- lõi bản đồ (dùng chung cho Live/Replay/Maps) ----------
+function newWorld(){ return { grid:new Map(), carX:0, carY:0, ang:-Math.PI/2, traj:[{x:0,y:0}], beam:null }; }
+function updateCell(W, cx, cy, d){ let k=cx+','+cy; let v=(W.grid.get(k)||0)+d; W.grid.set(k, Math.max(L_MIN,Math.min(L_MAX,v))); }
+function castRay(W, x0,y0,x1,y1,hit){
+  let cx0=Math.floor(x0/CELL),cy0=Math.floor(y0/CELL),cx1=Math.floor(x1/CELL),cy1=Math.floor(y1/CELL);
+  let dx=Math.abs(cx1-cx0),dy=Math.abs(cy1-cy0),sx=cx0<cx1?1:-1,sy=cy0<cy1?1:-1,err=dx-dy,cx=cx0,cy=cy0,g=0;
+  while(g++<3000){ if(cx===cx1&&cy===cy1)break; updateCell(W,cx,cy,L_FREE); let e2=2*err; if(e2>-dy){err-=dy;cx+=sx;} if(e2<dx){err+=dx;cy+=sy;} }
+  updateCell(W,cx1,cy1,hit?L_OCC:L_FREE);
+}
+function loColor(l){
+  // p = xác suất là VẬT CẢN (0..1).  l<0 -> trống (đi được),  l>0 -> vật cản
+  let p=1-1/(1+Math.exp(l));
+  if(p>=0.5){ // vật cản: cam -> đỏ đậm theo độ chắc chắn
+    let t=(p-0.5)*2;
+    return `rgb(${230-30*t|0},${110-70*t|0},${80-50*t|0})`;
+  }
+  // vùng trống / đi được: xám-xanh -> xanh trắng SÁNG (nổi trên nền xám)
+  let t=(0.5-p)*2;
+  return `rgb(${120+75*t|0},${150+85*t|0},${140+75*t|0})`;
+}
+
+// áp 1 khung telemetry vào world (dùng cho cả trực tiếp lẫn xem lại)
+function applyFrame(W, d){
+  let mv = (d.mv===undefined)?1:d.mv;
+  let dist = (d.dL!==undefined?d.dL:0) * 0.5 * PX_PER_CM * mv;
+  W.ang += ((d.gz||0)/131.0)*(Math.PI/180.0)*0.15;
+  W.carX += dist*Math.cos(W.ang); W.carY += dist*Math.sin(W.ang);
+  let last=W.traj[W.traj.length-1];
+  if(Math.hypot(W.carX-last.x,W.carY-last.y)>2) W.traj.push({x:W.carX,y:W.carY});
+  let beamAng = W.ang + (((d.ang||90)-90)*Math.PI/180.0);
+  W.beam = { x:W.carX,y:W.carY,ang:beamAng, dist:(d.dist>0&&d.dist<120)?d.dist:0 };
+  if(d.dist>0&&d.dist<120){ let hit=d.dist<100, r=Math.min(d.dist,100)*PX_PER_CM;
+    castRay(W,W.carX,W.carY,W.carX+r*Math.cos(beamAng),W.carY+r*Math.sin(beamAng),hit); }
+}
+
+function drawWorld(ctx, cv, W, view, bg){
+  const Wd=cv.width, Ht=cv.height, z=view.zoom*PX_PER_CM;
+  const sx=wx=>(wx-view.camX)*z+Wd/2, sy=wy=>(wy-view.camY)*z+Ht/2;
+  ctx.clearRect(0,0,Wd,Ht); ctx.fillStyle='#3a4047'; ctx.fillRect(0,0,Wd,Ht);   // nền xám = chưa quét
+  // map nền (nếu nạp) vẽ mờ trước
+  if(bg){ bg.grid.forEach((l,k)=>{ if(l===0)return; let i=k.indexOf(','),cx=+k.slice(0,i),cy=+k.slice(i+1);
+    let px=sx(cx*CELL),py=sy(cy*CELL); if(px<-6||py<-6||px>Wd||py>Ht)return; ctx.globalAlpha=0.35; ctx.fillStyle=loColor(l); ctx.fillRect(px,py,Math.ceil(CELL*view.zoom),Math.ceil(CELL*view.zoom)); ctx.globalAlpha=1; }); }
+  // lưới 50cm
+  ctx.strokeStyle='rgba(0,0,0,0.10)'; ctx.lineWidth=1; let g=50*z;
+  if(g>8){ let ox=(Wd/2-view.camX*z)%g, oy=(Ht/2-view.camY*z)%g;
+    for(let x=ox;x<Wd;x+=g){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,Ht);ctx.stroke();}
+    for(let y=oy;y<Ht;y+=g){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(Wd,y);ctx.stroke();} }
+  // ô vật cản
+  const cs=Math.max(1,Math.ceil(CELL*view.zoom));
+  W.grid.forEach((l,k)=>{ if(l===0)return; let i=k.indexOf(','),cx=+k.slice(0,i),cy=+k.slice(i+1);
+    let px=sx(cx*CELL),py=sy(cy*CELL); if(px<-cs||py<-cs||px>Wd||py>Ht)return; ctx.fillStyle=loColor(l); ctx.fillRect(px,py,cs,cs); });
+  // quỹ đạo
+  if(W.traj.length>1){ ctx.strokeStyle='rgba(52,211,153,0.55)'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(sx(W.traj[0].x),sy(W.traj[0].y)); for(let p of W.traj)ctx.lineTo(sx(p.x),sy(p.y)); ctx.stroke(); }
+  // tia quét
+  if(W.beam&&W.beam.dist>0){ let bx=sx(W.beam.x),by=sy(W.beam.y),ex=sx(W.beam.x+W.beam.dist*Math.cos(W.beam.ang)*PX_PER_CM),ey=sy(W.beam.y+W.beam.dist*Math.sin(W.beam.ang)*PX_PER_CM); ctx.strokeStyle='rgba(61,139,253,0.5)'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(ex,ey); ctx.stroke(); }
+  // robot
+  let rx=sx(W.carX),ry=sy(W.carY); ctx.fillStyle='#34d399'; ctx.beginPath(); ctx.arc(rx,ry,7,0,6.28); ctx.fill();
+  ctx.strokeStyle='#fff'; ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(rx,ry); ctx.lineTo(rx+18*Math.cos(W.ang),ry+18*Math.sin(W.ang)); ctx.stroke();
+  // thước 50cm
+  let p50=50*z, bx=14, by=Ht-16; ctx.strokeStyle='#1c2128'; ctx.fillStyle='#1c2128'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(bx+p50,by); ctx.moveTo(bx,by-4); ctx.lineTo(bx,by+4); ctx.moveTo(bx+p50,by-4); ctx.lineTo(bx+p50,by+4); ctx.stroke();
+  ctx.font='11px Arial'; ctx.fillText('50 cm', bx, by-6);
+}
+
+// pan/zoom đơn giản cho 1 canvas + view
+function attachPanZoom(cv, view, redraw){
+  let drag=false,lx=0,ly=0;
+  const wpx=()=>view.zoom*PX_PER_CM*(cv.clientWidth/cv.width);
+  cv.addEventListener('pointerdown',e=>{drag=true;view.follow=false;lx=e.clientX;ly=e.clientY;cv.setPointerCapture(e.pointerId);});
+  cv.addEventListener('pointermove',e=>{ if(!drag)return; view.camX-=(e.clientX-lx)/wpx(); view.camY-=(e.clientY-ly)/wpx(); lx=e.clientX;ly=e.clientY; redraw(); });
+  cv.addEventListener('pointerup',()=>drag=false);
+  cv.addEventListener('wheel',e=>{e.preventDefault(); view.zoom=Math.max(0.2,Math.min(6,view.zoom*(e.deltaY<0?1.1:0.9))); redraw();},{passive:false});
+}
+
+// ---------- TAB ----------
+document.querySelectorAll('.tabs button').forEach(b=>b.addEventListener('click',()=>{
+  const t=b.dataset.t;
+  document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===t));
+  document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('active',x===b));
+  if(t==='replay') loadSessions();
+  if(t==='maps'){ loadMaps(); drawMapsTab(); }
+}));
+
+// ================= TRỰC TIẾP =================
+const liveCv=document.getElementById('liveCanvas'), liveCtx=liveCv.getContext('2d');
+let liveW=newWorld(), liveView={camX:0,camY:0,zoom:1,follow:true}, bgMap=null, autoOn=false, spdSynced=false;
+function liveDraw(){ if(liveView.follow){liveView.camX=liveW.carX;liveView.camY=liveW.carY;} drawWorld(liveCtx,liveCv,liveW,liveView,bgMap); }
+attachPanZoom(liveCv, liveView, liveDraw);
+
+let ws;
+function wsUrl(){ const p=location.protocol==='https:'?'wss':'ws'; return `${p}://${location.host}/ws/dashboard`; }
+function setRobot(on){ const el=document.getElementById('robotPill'); el.className='pill '+(on?'on':'off'); el.innerText='Robot: '+(on?'online':'offline'); }
+function connect(){
+  ws=new WebSocket(wsUrl());
+  ws.onclose=()=>{ setRobot(false); setTimeout(connect,2000); };
+  ws.onmessage=e=>{ const m=JSON.parse(e.data);
+    if(m.type==='robot_status'){ setRobot(m.online); return; }
+    if(m.type!=='telemetry') return;
+    const d=m.data; setRobot(true);
+    applyFrame(liveW,d);
+    document.getElementById('tDist').innerText=(d.dist>0?d.dist.toFixed(0):'--')+' cm';
+    document.getElementById('tMove').innerText='Move: '+(d.mv===1?'TIẾN':d.mv===-1?'LÙI':'quay/dừng');
+    const sf=document.getElementById('tSafe'); if(d.safe===0){sf.innerText='OBSTACLE';sf.className='pill off';}else{sf.innerText='SAFE';sf.className='pill';}
+    const md=document.getElementById('tMode'); md.innerText=d.auto?'AUTO':'MANUAL';
+    if(d.auto!==undefined && !!d.auto!==autoOn) setAutoUI(d.auto===1);
+    // hiển thị robot đang làm gì
+    if(d.auto && d.ast!==undefined){
+      const A=['đi thẳng','ngó trái','ngó phải','quyết định','lùi','rẽ'];
+      document.getElementById('tMove').innerText='Auto: '+(A[d.ast]||'-');
+    }
+    if(d.spd!==undefined && !spdSynced){ document.getElementById('spd').value=d.spd; document.getElementById('spdVal').innerText=d.spd; spdSynced=true; }
+    liveDraw();
+  };
+}
+function send(o){ if(ws&&ws.readyState===1) ws.send(JSON.stringify(o)); }
+function setAutoUI(on){ autoOn=on; const b=document.getElementById('autoBtn'); b.innerText=on?'🤖 AUTO: ON':'🤖 AUTO: OFF'; b.className=on?'btn on':'btn'; }
+document.getElementById('autoBtn').onclick=()=>{ setAutoUI(!autoOn); send({cmd:'a',st:autoOn?1:0}); };
+document.querySelectorAll('#dpad .btn').forEach(b=>{ const d=b.dataset.d;
+  const press=e=>{e.preventDefault(); send({cmd:d,st:1}); if(d!=='s')setAutoUI(false);};
+  const rel=e=>{ if(e)e.preventDefault(); if(d!=='s') send({cmd:d,st:0}); };
+  b.addEventListener('pointerdown',press); b.addEventListener('pointerup',rel); b.addEventListener('pointerleave',rel);
+});
+const spdEl=document.getElementById('spd'); spdEl.oninput=()=>{document.getElementById('spdVal').innerText=spdEl.value; send({cmd:'speed',val:parseInt(spdEl.value)});};
+const trimEl=document.getElementById('trim'); trimEl.oninput=()=>{document.getElementById('trimVal').innerText=trimEl.value; send({cmd:'trim',val:parseInt(trimEl.value)});};
+document.getElementById('liveClear').onclick=()=>{ liveW=newWorld(); liveView.follow=true; liveDraw(); };
+document.getElementById('liveSaveMap').onclick=async()=>{
+  const name=prompt('Tên map:', 'Map '+new Date().toLocaleString());
+  if(!name) return;
+  const cells=Array.from(liveW.grid.entries()).map(([k,l])=>{let i=k.indexOf(',');return [+k.slice(0,i),+k.slice(i+1),Math.round(l*100)/100];});
+  await fetch('/api/maps',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name, data:{cells, traj:liveW.traj}})});
+  alert('Đã lưu map "'+name+'" vào kho.');
+};
+
+// ================= XEM LẠI =================
+const rpCv=document.getElementById('replayCanvas'), rpCtx=rpCv.getContext('2d');
+let rpW=newWorld(), rpView={camX:0,camY:0,zoom:1,follow:true};
+let rpFrames=[], rpIdx=0, rpPlaying=false, rpSpeed=1, rpTimer=null, rpT0=0;
+function rpDraw(){ if(rpView.follow){rpView.camX=rpW.carX;rpView.camY=rpW.carY;} drawWorld(rpCtx,rpCv,rpW,rpView,null); }
+attachPanZoom(rpCv, rpView, rpDraw);
+
+async function loadSessions(){
+  const list=document.getElementById('sesList'); list.innerHTML='<div class="empty">Đang tải…</div>';
+  try{
+    const ss=await (await fetch('/api/sessions')).json();
+    if(!ss.length){ list.innerHTML='<div class="empty">Chưa có phiên nào. Hãy chạy robot một lần.</div>'; return; }
+    list.innerHTML='';
+    ss.forEach(s=>{ const div=document.createElement('div'); div.className='item';
+      div.innerHTML=`<div class="meta">${s.id}<small>${s.duration_s}s · ${s.frames} khung</small></div>`;
+      const open=document.createElement('button'); open.className='btn'; open.innerText='Mở'; open.onclick=()=>openSession(s.id);
+      const del=document.createElement('button'); del.className='btn bad'; del.innerText='Xóa';
+      del.onclick=async()=>{ await fetch('/api/sessions/'+s.id,{method:'DELETE'}); loadSessions(); };
+      div.appendChild(open); div.appendChild(del); list.appendChild(div); });
+  }catch(e){ list.innerHTML='<div class="empty">Không tải được danh sách.</div>'; }
+}
+async function openSession(id){
+  const ses=await (await fetch('/api/sessions/'+id)).json();
+  rpFrames=ses.frames||[]; rpIdx=0; rpW=newWorld(); rpView.follow=true;
+  document.getElementById('rpSeek').max=Math.max(0,rpFrames.length-1);
+  document.getElementById('rpSeek').value=0;
+  rpStop(); rebuildTo(0); rpDraw();
+}
+function rebuildTo(idx){ // dựng lại map từ đầu tới khung idx
+  rpW=newWorld();
+  for(let i=0;i<=idx && i<rpFrames.length;i++) applyFrame(rpW, rpFrames[i]);
+  rpIdx=idx;
+  const t=rpFrames[idx]? (rpFrames[idx]._t||0)/1000 : 0;
+  document.getElementById('rpTime').innerText=t.toFixed(1)+'s';
+  document.getElementById('rpSeek').value=idx;
+}
+function rpStep(){ // phát theo thời gian thực _t
+  if(!rpPlaying||!rpFrames.length) return;
+  const now=performance.now(); const elapsed=(now-rpT0)*rpSpeed;
+  const baseT=rpFrames[rpIdx]?(rpFrames[rpIdx]._t||0):0;
+  let j=rpIdx;
+  while(j+1<rpFrames.length && ((rpFrames[j+1]._t||0)-baseT)<=elapsed){ j++; applyFrame(rpW,rpFrames[j]); }
+  if(j!==rpIdx){ rpIdx=j; document.getElementById('rpSeek').value=j; document.getElementById('rpTime').innerText=((rpFrames[j]._t||0)/1000).toFixed(1)+'s'; rpDraw(); rpT0=now; }
+  if(rpIdx>=rpFrames.length-1){ rpStop(); }
+}
+function rpPlay(){ if(!rpFrames.length)return; if(rpIdx>=rpFrames.length-1) rebuildTo(0); rpPlaying=true; rpT0=performance.now(); document.getElementById('rpPlay').innerText='⏸ Dừng'; rpTimer=setInterval(rpStep,50); }
+function rpStop(){ rpPlaying=false; if(rpTimer)clearInterval(rpTimer); document.getElementById('rpPlay').innerText='▶ Phát'; }
+document.getElementById('rpPlay').onclick=()=>{ rpPlaying?rpStop():rpPlay(); };
+document.getElementById('rpSeek').oninput=e=>{ rpStop(); rebuildTo(parseInt(e.target.value)); rpDraw(); };
+document.querySelectorAll('[data-spd]').forEach(b=>b.onclick=()=>{ rpSpeed=parseFloat(b.dataset.spd); rpT0=performance.now(); });
+
+// ================= KHO MAP =================
+const mpCv=document.getElementById('mapCanvas'), mpCtx=mpCv.getContext('2d');
+let mpW=newWorld(), mpView={camX:0,camY:0,zoom:1,follow:false};
+function drawMapsTab(){ drawWorld(mpCtx,mpCv,mpW,mpView,null); }
+attachPanZoom(mpCv, mpView, drawMapsTab);
+async function loadMaps(){
+  const list=document.getElementById('mapList'); list.innerHTML='<div class="empty">Đang tải…</div>';
+  try{
+    const ms=await (await fetch('/api/maps')).json();
+    if(!ms.length){ list.innerHTML='<div class="empty">Kho trống. Lưu map từ tab Trực tiếp.</div>'; return; }
+    list.innerHTML='';
+    ms.forEach(m=>{ const div=document.createElement('div'); div.className='item';
+      div.innerHTML=`<div class="meta">${m.name}<small>${new Date(m.created*1000).toLocaleString()}</small></div>`;
+      const view=document.createElement('button'); view.className='btn'; view.innerText='Xem'; view.onclick=()=>showMap(m.id);
+      const useBg=document.createElement('button'); useBg.className='btn warn'; useBg.innerText='Dùng làm nền'; useBg.onclick=()=>useAsBackground(m.id);
+      const del=document.createElement('button'); del.className='btn bad'; del.innerText='Xóa'; del.onclick=async()=>{ await fetch('/api/maps/'+m.id,{method:'DELETE'}); loadMaps(); };
+      div.appendChild(view); div.appendChild(useBg); div.appendChild(del); list.appendChild(div); });
+  }catch(e){ list.innerHTML='<div class="empty">Không tải được.</div>'; }
+}
+function gridFromCells(cells){ const W=newWorld(); (cells||[]).forEach(([cx,cy,l])=>W.grid.set(cx+','+cy,l)); return W; }
+async function showMap(id){
+  const m=await (await fetch('/api/maps/'+id)).json();
+  mpW=gridFromCells(m.data&&m.data.cells); if(m.data&&m.data.traj) mpW.traj=m.data.traj;
+  mpView.follow=false; mpView.camX=0; mpView.camY=0; drawMapsTab();
+}
+async function useAsBackground(id){
+  const m=await (await fetch('/api/maps/'+id)).json();
+  bgMap=gridFromCells(m.data&&m.data.cells);
+  alert('Đã đặt làm nền cho tab Trực tiếp. Robot sẽ quét chồng lên nền này.');
+  liveDraw();
+}
+
+// ---------- khởi động ----------
+connect(); liveDraw();
+</script>
+</body>
+</html>
