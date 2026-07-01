@@ -99,12 +99,14 @@ try: i2c.writeto_mem(MPU_ADDR,0x6B,b'\x00')
 except Exception as e: print("MPU?",e)
 
 # ===================== Tham số =====================
-manualSpeed=200; autoSpeed=160; AUTO_MIN_SPEED=90; motorBalance=0
+manualSpeed=140; autoSpeed=60; AUTO_MIN_SPEED=50; motorBalance=0   # CHẬM mà chắc trong tự hành
 KP_STRAIGHT=6; STRAIGHT_CORR_MAX=45
-SAFE_DISTANCE=20.0; SLOW_DISTANCE=45.0
-AUTO_STOP_DIST=25.0; AUTO_CLEAR_DIST=35.0; STUCK_DIST=14.0
+SAFE_DISTANCE=20.0; SLOW_DISTANCE=90.0     # bắt đầu giảm tốc từ xa hơn (90cm thay vì 70cm)
+AUTO_STOP_DIST=45.0; AUTO_CLEAR_DIST=55.0; STUCK_DIST=14.0   # chừa khoảng an toàn rộng hơn để bù quán tính khi phanh
 SERVO_MIN,SERVO_MAX,SERVO_STEP=30,150,6
-SERVO_SETTLE=250; TURN_MIN=250; TURN_MAX=1800; BACKUP_SHORT=450; BACKUP_LONG=800
+SERVO_SETTLE=300; TURN_MIN=250; TURN_MAX=1800; BACKUP_SHORT=450; BACKUP_LONG=800
+DRIVE_MS=1300; SCAN_MS=1700                # đi đoạn NGẮN hơn (1.3s) rồi dừng quét -> phát hiện vật sớm hơn, map cũng chính xác hơn
+BRAKE_MS=90                                 # thời gian phanh ngược ngắn khi dừng khẩn, giảm quãng trớn
 # Vùng góc HẸP coi là "thẳng trước" để quyết định đi/dừng (không khựng vì vật chéo)
 FRONT_NARROW_LO=72; FRONT_NARROW_HI=108
 
@@ -115,6 +117,9 @@ servoAngle=90; servoDir=1; motionDir=0
 autoMode=False; autoState=0; autoTimer=0; backupTime=0; distLeft=0.0; distRight=0.0; turnDir=1
 forwardCmd=backCmd=leftCmd=rightCmd=False
 _dist_buf=[]; _front_samples=[]
+_dist_buf_angle=None      # góc servo mà lô mẫu _dist_buf hiện tại thuộc về (tránh trộn khoảng cách của các góc khác nhau)
+_heading_accum_deg=0.0    # góc quay dồn tích từ lần gửi telemetry trước, tính bằng tích phân LIÊN TỤC (không phụ thuộc chu kỳ gửi)
+_last_gyro_ms=0
 _straight_active=False; _baseL=0; _baseR=0
 _prev_moving=False; _kick_until=0; KICK_MS=130   # "đá ga" 130ms khi khởi động chống kẹt
 
@@ -143,6 +148,16 @@ def driveStop():
     global motionDir; motionDir=0
     _kick_check(False)
     IN1.value(0);IN2.value(0);IN3.value(0);IN4.value(0); ena.duty_u16(0); enb.duty_u16(0)
+def driveBrake(ms):
+    # Phanh chủ động: nếu đang tiến, đảo chiều ngắn (BRAKE_MS) để triệt bớt quán tính trước khi
+    # cắt hẳn điện. Chỉ cắt điện đơn thuần (driveStop) khiến robot trôi thêm 1 đoạn theo trớn,
+    # dễ vượt qua ngưỡng an toàn AUTO_STOP_DIST và đâm vào vật -> đây là phanh CÓ chủ đích.
+    global motionDir
+    if motionDir==1:
+        IN1.value(0);IN2.value(1);IN3.value(0);IN4.value(1)
+        ena.duty_u16(_duty(190)); enb.duty_u16(_duty(190))
+        time.sleep_ms(ms)
+    driveStop()
 def _straight_reset():
     global _straight_active,_baseL,_baseR; _straight_active=True; _baseL=ticksL; _baseR=ticksR
 def driveForwardStraight(speed):
@@ -181,11 +196,25 @@ def readDistanceOnce():
     trig.value(0); time.sleep_us(2); trig.value(1); time.sleep_us(10); trig.value(0)
     d=time_pulse_us(echo,1,8000)
     return -1.0 if d<0 else (d*0.0343)/2.0
-def readGyroZ():
+def readGyroZRaw():
     try:
         d=i2c.readfrom_mem(MPU_ADDR,0x47,2); r=(d[0]<<8)|d[1]
         return r-65536 if r>32767 else r
     except Exception: return 0
+
+GYRO_OFFSET=0.0
+def calibrateGyro(samples=200):
+    # Giữ robot đứng yên khi cấp nguồn để đo độ lệch (bias) của gyro Z.
+    # Nếu không trừ offset này, mỗi lần tích phân góc sẽ trôi dần -> map bị cong/méo
+    # dù robot đi đúng đường (đây là nguyên nhân chính khiến map hình chữ L bị bo tròn).
+    global GYRO_OFFSET
+    print("Đang hiệu chỉnh gyro, giữ robot đứng yên...")
+    total=0
+    for i in range(samples):
+        total+=readGyroZRaw()
+        time.sleep_ms(3)
+    GYRO_OFFSET=total/samples
+    print("Gyro offset =",GYRO_OFFSET)
 def canMoveForward():
     return (frontGuard>SAFE_DISTANCE) and (not cliffAhead)
 
@@ -223,10 +252,12 @@ def handle_command(text):
 def runAuto():
     global autoState,autoTimer,servoAngle,servoDir,distLeft,distRight,turnDir,backupTime,_straight_active
     now=time.ticks_ms()
-    if autoState==0:
+    if autoState==0:    # DRIVE: đi thẳng đoạn ngắn, servo nhìn thẳng canh trước
         if cliffAhead or frontGuard<AUTO_STOP_DIST:
-            driveStop(); _straight_active=False
+            driveBrake(BRAKE_MS); _straight_active=False
             servoAngle=SERVO_MAX; setServoAngle(servoAngle); autoTimer=now; autoState=1
+        elif time.ticks_diff(now,autoTimer)>=DRIVE_MS:   # đi đủ 1 đoạn -> dừng quét bồi map
+            driveStop(); _straight_active=False; autoTimer=now; autoState=6
         else:
             if frontGuard>=SLOW_DISTANCE: spd=autoSpeed
             else:
@@ -263,7 +294,13 @@ def runAuto():
         driveLeft(autoSpeed) if turnDir<0 else driveRight(autoSpeed)
         el=time.ticks_diff(now,autoTimer)
         if (frontGuard>AUTO_CLEAR_DIST and el>=TURN_MIN) or el>=TURN_MAX:
-            autoState=0; servoDir=1; _straight_active=False   # vào FORWARD, đi 1 mạch dài để khám phá
+            servoAngle=90; setServoAngle(90); servoDir=1
+            autoState=0; autoTimer=now; _straight_active=False
+    elif autoState==6:    # SCAN_MAP: đứng yên quét rộng (servo do main loop quét) để bồi map
+        driveStop(); _straight_active=False
+        if time.ticks_diff(now,autoTimer)>=SCAN_MS:
+            servoAngle=90; setServoAngle(90); servoDir=1
+            autoState=0; autoTimer=now
 
 # ===================== WiFi =====================
 def wifi_connect():
@@ -305,6 +342,8 @@ def wifi_connect():
 def main():
     global frontDistance,frontTrust,frontGuard,cliffAhead,rearObstacle
     global servoAngle,servoDir,lastTicksL,lastTicksR,_straight_active,_dist_buf,_front_samples
+    global _dist_buf_angle,_heading_accum_deg,_last_gyro_ms
+    calibrateGyro()
     driveStop(); wifi_connect()
     ws=WSClient(SERVER_HOST,SERVER_PORT,SERVER_PATH)
     last_sonar=last_servo=last_send=time.ticks_ms()
@@ -314,10 +353,18 @@ def main():
             except Exception as e:
                 print("Lỗi:",e); driveStop(); time.sleep_ms(2000); continue
         now=time.ticks_ms()
+        # Tích phân góc quay LIÊN TỤC mỗi vòng lặp bằng dt THỰC ĐO ĐƯỢC (time.ticks_diff),
+        # thay vì để phía web giả định mỗi gói tin cách nhau đúng 150ms cố định. Mạng có thể
+        # trễ/dồn gói bất kỳ lúc nào -> nếu giả định sai dt, góc tích phân sai theo, làm map méo.
+        dt_gyro_ms=time.ticks_diff(now,_last_gyro_ms)
+        _last_gyro_ms=now
+        if 0<dt_gyro_ms<200:   # bỏ qua nếu dt bất thường (vừa mất kết nối, lệnh block lâu, v.v.)
+            rate_dps=(readGyroZRaw()-GYRO_OFFSET)/131.0
+            _heading_accum_deg+=rate_dps*(dt_gyro_ms/1000.0)
         # SERVO theo kiểu một-sonar: đang đi -> NHÌN THẲNG canh trước (không mù);
         # đứng yên -> quét rộng để dựng map. Auto đang ngó trái/phải -> FSM tự giữ servo.
         if time.ticks_diff(now,last_servo)>=55:
-            fsm=autoMode and autoState!=0
+            fsm=autoMode and autoState!=0 and autoState!=6   # state 6 cũng cho quét rộng
             if not fsm:
                 if motionDir!=0:                       # đang di chuyển -> thẳng 90
                     if servoAngle!=90: servoAngle=90; setServoAngle(90)
@@ -330,6 +377,12 @@ def main():
             last_servo=now
         # sonar (một con trên servo) + median + frontTrust = vật gần nhất thẳng trước trong 600ms
         if time.ticks_diff(now,last_sonar)>=35:
+            # Servo vừa đổi góc từ lần đo trước -> xóa buffer cũ. Nếu không, median filter sẽ
+            # TRỘN các khoảng cách đo được ở NHIỀU góc khác nhau (do buffer giữ 5 mẫu gần nhất theo
+            # thời gian, không theo góc) -> khi ghép vào map, khoảng cách bị gán sai lệch so với góc
+            # thật -> chính là nguyên nhân làm góc tường bị bo tròn/nhòe thay vì sắc nét.
+            if servoAngle!=_dist_buf_angle:
+                _dist_buf=[]; _dist_buf_angle=servoAngle
             d=readDistanceOnce()
             if d>0:
                 _dist_buf.append(d)
@@ -349,7 +402,11 @@ def main():
             runAuto()
         else:
             spd=manualSpeed
-            if SAFE_DISTANCE<frontGuard<SLOW_DISTANCE: spd=manualSpeed//2
+            # lái tay: chỉ giảm tốc khi tới GẦN (40cm), và giữ SÀN đủ khỏe để bánh không kẹt
+            if SAFE_DISTANCE<frontGuard<40.0:
+                spd=manualSpeed//2
+                if spd<80: spd=80
+                if spd>manualSpeed: spd=manualSpeed
             if forwardCmd and canMoveForward():
                 if not _straight_active: _straight_reset()
                 driveForwardStraight(spd)
@@ -362,14 +419,15 @@ def main():
         if msg is not None: handle_command(msg)
         # gửi telemetry
         if time.ticks_diff(now,last_send)>=150:
-            gz=readGyroZ()
+            dz=_heading_accum_deg; _heading_accum_deg=0.0   # góc quay dồn tích, reset sau khi gửi
+            ang_for_dist=_dist_buf_angle if _dist_buf_angle is not None else servoAngle
             dnL=ticksL-lastTicksL; lastTicksL=ticksL
             dnR=ticksR-lastTicksR; lastTicksR=ticksR
             dL=(dnL+dnR)//2
             if autoMode: safe=0 if (cliffAhead or frontGuard<AUTO_STOP_DIST) else 1
             else: safe=1 if canMoveForward() else 0
-            pkt={"ticks":ticksL+ticksR,"dL":dL,"dnL":dnL,"dnR":dnR,"gz":gz,
-                 "dist":round(frontDistance,1),"ang":servoAngle,"mv":motionDir,
+            pkt={"ticks":ticksL+ticksR,"dL":dL,"dnL":dnL,"dnR":dnR,"dz":round(dz,3),
+                 "dist":round(frontDistance,1),"ang":ang_for_dist,"mv":motionDir,
                  "ast":autoState,"spd":manualSpeed,"safe":safe,"rear":1 if rearObstacle else 0,
                  "auto":1 if autoMode else 0}
             try: ws.send(json.dumps(pkt))
