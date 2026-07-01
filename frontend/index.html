@@ -13,8 +13,14 @@
   .top{ display:flex; align-items:center; gap:10px; padding:12px 16px; background:var(--bg2); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:5; }
   .top b{ font-size:16px; } .top small{ color:var(--mut); font-size:11px; display:block; }
   .sp{ flex:1; }
-  .pill{ font-family:var(--mono); font-size:12px; padding:4px 10px; border-radius:999px; background:var(--panel); border:1px solid var(--line); }
+  .pill{ font-family:var(--mono); font-size:12px; padding:4px 9px; border-radius:999px; background:var(--panel); border:1px solid var(--line); white-space:nowrap; }
   .pill.on{ color:var(--ok); border-color:#1f6b3c; } .pill.off{ color:var(--bad); border-color:#5a2326; }
+  @media (max-width:480px){
+    .top{ padding:10px 12px; gap:6px; } .top b{ font-size:14px; } .top small{ font-size:10px; }
+    .pill{ font-size:11px; padding:3px 7px; }
+    .telg{ gap:5px; } .tabs button{ font-size:13px; padding:10px 0; }
+    .view{ padding:10px; } .btn{ padding:10px 13px; font-size:13px; margin:3px; }
+  }
   .tabs{ display:flex; background:var(--bg2); border-bottom:1px solid var(--line); }
   .tabs button{ flex:1; background:none; border:none; color:var(--mut); padding:12px 0; font-size:14px; border-bottom:2px solid transparent; }
   .tabs button.active{ color:var(--accent); border-bottom-color:var(--accent); }
@@ -55,8 +61,7 @@
     <div class="telg">
       <span class="pill" id="tDist">-- cm</span>
       <span class="pill" id="tMove">--</span>
-      <span class="pill" id="tSafe">SAFE</span>
-      <span class="pill" id="tMode">MANUAL</span>
+      <span class="pill" id="tSafe">an toàn</span>
     </div>
     <div class="pad">
       <button class="btn" id="autoBtn">🤖 AUTO: OFF</button>
@@ -71,10 +76,8 @@
       </div>
     </div>
     <div class="card">
-      <div class="slabel"><span>Tốc độ</span><b id="spdVal">200</b></div>
-      <input type="range" min="80" max="255" value="200" id="spd">
-      <div class="slabel" style="margin-top:8px;"><span>Trim (cân bằng)</span><b id="trimVal">0</b></div>
-      <input type="range" min="-80" max="80" value="0" id="trim">
+      <div class="slabel"><span>Tốc độ</span><b id="spdVal">140</b></div>
+      <input type="range" min="60" max="200" value="140" id="spd">
     </div>
     <div class="row"><button class="btn" id="liveSaveMap">💾 Lưu map hiện tại</button>
       <button class="btn bad" id="liveClear">Xóa map</button></div>
@@ -106,16 +109,31 @@
 
 <script>
 "use strict";
-const PX_PER_CM = 1.5, CELL = 5, L_OCC=0.9, L_FREE=-0.35, L_MIN=-4, L_MAX=4;
+// L_OCC giảm từ 1.2 -> 0.8: MỘT lần chạm không còn đủ để ô trở thành "tường chắc" ngay lập tức.
+// OCC_SOLID tăng lên 1.5: cần ~2 lần chạm liên tiếp cùng chỗ mới bị coi là chắc chắn -> tia mới bị chặn.
+// Trước đây 1 tiếng "dội" nhiễu (rất hay gặp với cảm biến siêu âm) đã tạo tường ảo, tường ảo này
+// chặn hết các tia quét sau đi ngang qua -> để lại vùng "chưa quét" (lỗ đen) phía sau nó mãi mãi.
+const PX_PER_CM = 1.5, CELL = 5, L_OCC=0.8, L_FREE=-0.35, L_MIN=-4, L_MAX=4;
+const FREE_FILL='#c7dbd3';   // màu đồng nhất cho vùng đi được (nối liền, không viền pixel)
+const BEAM_HALF_FOV = 0.10;  // ~11° mỗi bên: mô phỏng góc mở thật của cảm biến siêu âm/hồng ngoại
 
 // ---------- lõi bản đồ (dùng chung cho Live/Replay/Maps) ----------
-function newWorld(){ return { grid:new Map(), carX:0, carY:0, ang:-Math.PI/2, traj:[{x:0,y:0}], beam:null }; }
+function newWorld(){ return { grid:new Map(), carX:0, carY:0, ang:-Math.PI/2, traj:[{x:0,y:0}], beam:null, prevScan:null }; }
 function updateCell(W, cx, cy, d){ let k=cx+','+cy; let v=(W.grid.get(k)||0)+d; W.grid.set(k, Math.max(L_MIN,Math.min(L_MAX,v))); }
+const OCC_SOLID=1.5;   // ô >= mức này coi là tường chắc -> tia tô-trống KHÔNG xuyên qua
 function castRay(W, x0,y0,x1,y1,hit){
   let cx0=Math.floor(x0/CELL),cy0=Math.floor(y0/CELL),cx1=Math.floor(x1/CELL),cy1=Math.floor(y1/CELL);
   let dx=Math.abs(cx1-cx0),dy=Math.abs(cy1-cy0),sx=cx0<cx1?1:-1,sy=cy0<cy1?1:-1,err=dx-dy,cx=cx0,cy=cy0,g=0;
-  while(g++<3000){ if(cx===cx1&&cy===cy1)break; updateCell(W,cx,cy,L_FREE); let e2=2*err; if(e2>-dy){err-=dy;cx+=sx;} if(e2<dx){err+=dx;cy+=sy;} }
-  updateCell(W,cx1,cy1,hit?L_OCC:L_FREE);
+  while(g++<3000){
+    if(cx===cx1&&cy===cy1)break;
+    if((W.grid.get(cx+','+cy)||0)>=OCC_SOLID) return;   // gặp tường chắc -> dừng, không đào xuyên
+    updateCell(W,cx,cy,L_FREE);
+    let e2=2*err; if(e2>-dy){err-=dy;cx+=sx;} if(e2<dx){err+=dx;cy+=sy;}
+  }
+  if(hit){ // chạm vật -> LẬT ô thành vật cản NGAY (kể cả nơi từng tô trống) để hiện chỗ chắn
+    let k=cx1+','+cy1, cur=W.grid.get(k)||0;
+    W.grid.set(k, Math.min(L_MAX, Math.max(cur+L_OCC, L_OCC)));
+  } else updateCell(W,cx1,cy1,L_FREE);
 }
 function loColor(l){
   // p = xác suất là VẬT CẢN (0..1).  l<0 -> trống (đi được),  l>0 -> vật cản
@@ -129,43 +147,135 @@ function loColor(l){
   return `rgb(${120+75*t|0},${150+85*t|0},${140+75*t|0})`;
 }
 
+// Vẽ vùng TRỐNG mượt: dựng ảnh ở độ phân giải ô rồi phóng to có làm mịn -> mảng liền, không thấy ô pixel
+function drawFreeSmooth(ctx, W, sx, sy, z, alpha){
+  let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity,any=false;
+  W.grid.forEach((l,k)=>{ if(l>=0)return; any=true; let i=k.indexOf(','),cx=+k.slice(0,i),cy=+k.slice(i+1);
+    if(cx<minX)minX=cx; if(cx>maxX)maxX=cx; if(cy<minY)minY=cy; if(cy>maxY)maxY=cy; });
+  if(!any) return;
+  let w=maxX-minX+1, h=maxY-minY+1;
+  if(w<1||h<1||w*h>4000000) return;
+  let off=document.createElement('canvas'); off.width=w; off.height=h;
+  let octx=off.getContext('2d'), img=octx.createImageData(w,h);
+  const R=0x8f,G=0xc4,B=0xdb;   // xanh dương nhạt cho vùng đã quét/đi được, tách biệt hẳn với màu xanh lá của robot
+  W.grid.forEach((l,k)=>{ if(l>=0)return; let i=k.indexOf(','),cx=+k.slice(0,i),cy=+k.slice(i+1);
+    let idx=((cy-minY)*w+(cx-minX))*4; img.data[idx]=R; img.data[idx+1]=G; img.data[idx+2]=B; img.data[idx+3]=255; });
+  octx.putImageData(img,0,0);
+  // VÁ LỖ NHỎ: nếu 1 ô "chưa quét" (alpha=0) bị bao quanh phần lớn bởi ô trống (alpha=255),
+  // tô luôn nó thành trống để loại các đốm lỗ lẻ tẻ (do tia quét bỏ sót 1-2 ô). Chỉ ảnh hưởng
+  // hiển thị, KHÔNG sửa dữ liệu log-odds gốc trong W.grid.
+  if(w>2 && h>2){
+    let src=img.data, out=octx.createImageData(w,h), dst=out.data;
+    dst.set(src);
+    for(let y=1;y<h-1;y++){
+      for(let x=1;x<w-1;x++){
+        let idx=(y*w+x)*4;
+        if(src[idx+3]!==0) continue; // đã trống rồi, bỏ qua
+        let cnt=0;
+        for(let oy=-1;oy<=1;oy++) for(let ox=-1;ox<=1;ox++){
+          if(ox===0&&oy===0) continue;
+          if(src[((y+oy)*w+(x+ox))*4+3]!==0) cnt++;
+        }
+        if(cnt>=6){ dst[idx]=R; dst[idx+1]=G; dst[idx+2]=B; dst[idx+3]=255; }
+      }
+    }
+    octx.putImageData(out,0,0);
+  }
+  let dx=sx(minX*CELL), dy=sy(minY*CELL), dw=w*CELL*z, dh=h*CELL*z;
+  ctx.save(); ctx.imageSmoothingEnabled=true; ctx.imageSmoothingQuality='high';
+  if(alpha!==undefined) ctx.globalAlpha=alpha;
+  ctx.drawImage(off, dx, dy, dw, dh);
+  ctx.restore();
+}
+
 // áp 1 khung telemetry vào world (dùng cho cả trực tiếp lẫn xem lại)
 function applyFrame(W, d){
   let mv = (d.mv===undefined)?1:d.mv;
   let dist = (d.dL!==undefined?d.dL:0) * 0.5 * PX_PER_CM * mv;
-  W.ang += ((d.gz||0)/131.0)*(Math.PI/180.0)*0.15;
+  W.ang += (d.dz!==undefined ? d.dz*(Math.PI/180.0) : ((d.gz||0)/131.0)*(Math.PI/180.0)*0.15);
   W.carX += dist*Math.cos(W.ang); W.carY += dist*Math.sin(W.ang);
   let last=W.traj[W.traj.length-1];
   if(Math.hypot(W.carX-last.x,W.carY-last.y)>2) W.traj.push({x:W.carX,y:W.carY});
+
   let beamAng = W.ang + (((d.ang||90)-90)*Math.PI/180.0);
-  W.beam = { x:W.carX,y:W.carY,ang:beamAng, dist:(d.dist>0&&d.dist<120)?d.dist:0 };
-  if(d.dist>0&&d.dist<120){ let hit=d.dist<100, r=Math.min(d.dist,100)*PX_PER_CM;
-    castRay(W,W.carX,W.carY,W.carX+r*Math.cos(beamAng),W.carY+r*Math.sin(beamAng),hit); }
+  let turning = d.dz!==undefined ? Math.abs(d.dz) > 6 : Math.abs((d.gz||0)/131) > 40;          // xoay nhanh -> đo dễ nhòe, bỏ điểm vật (lọc nhiễu)
+  let hasHit = d.dist>0 && d.dist<120;
+
+  if(!hasHit){
+    // KHÔNG có echo hợp lệ (rất hay xảy ra khi tia gặp tường/góc nghiêng, âm/tia phản xạ chéo
+    // đi hướng khác không dội thẳng về cảm biến) -> TUYỆT ĐỐI không giả định "trống" ở đây.
+    // Trước đây code mặc định coi như trống tới 100cm, khiến mỗi lần "mù" lại tô 1 vệt trống
+    // xuyên qua tường thật -> tạo các "răng" lồi ra ngoài viền tường (đúng như trong ảnh chữ L).
+    // Giải pháp: bỏ qua cập nhật occupancy của khung này, coi vùng đó là "chưa biết" (màu xám),
+    // để lần quét khác (góc khác, vị trí khác) tự xác nhận sau.
+    W.beam = null;
+    return;
+  }
+
+  let curDist = Math.min(d.dist,100);
+  // Trước đây có "&& !turning" ở đây khiến MỌI lần chạm vật trong lúc thân robot đang xoay
+  // đều bị bỏ qua, không bao giờ ghi nhận tường. Giờ đã yêu cầu ~2 lần chạm mới thành tường
+  // chắc (OCC_SOLID) nên không còn sợ 1 lần nhiễu lúc xoay tạo tường ảo -> cho ghi nhận lại,
+  // để các góc chỉ "thấy" được trong lúc xoay (như góc lõm chữ L) vẫn có cơ hội được xác nhận.
+  let hit = d.dist<100;
+  W.beam = { x:W.carX,y:W.carY,ang:beamAng, dist:d.dist };
+
+  // LẤP QUẠT: chỉ nội suy lấp trống khi THÂN ROBOT ĐỨNG YÊN và chỉ servo tự quét (đúng mục
+  // đích ban đầu: lấp khe hở nhỏ giữa các bước servo liền kề, VÀI ĐỘ một). Khi thân đang XOAY
+  // (turning=true), TUYỆT ĐỐI không lấp: nếu 2 lần đo liền kề vô tình nằm ở 2 bên một góc lõm
+  // (như góc trong của chữ L), nội suy sẽ "vá phẳng" luôn góc lõm đó thành 1 cung tròn, biến
+  // cả phòng chữ L thành hình tròn -- đây chính là lỗi bạn gặp. Thà để trống (màu xám, chưa
+  // biết) còn hơn đoán bừa nối liền 2 điểm xa nhau khi đang xoay.
+  // Ngưỡng góc cũng thu hẹp lại (còn ~0.35 rad ~20°) vì giờ dz đã chính xác, không cần nới
+  // rộng để bù sai số thời gian như trước nữa.
+  if(W.prevScan && !turning){
+    let moved=Math.hypot(W.carX-W.prevScan.x, W.carY-W.prevScan.y);
+    let da=beamAng-W.prevScan.ang; while(da>Math.PI)da-=2*Math.PI; while(da<-Math.PI)da+=2*Math.PI;
+    if(moved<10 && Math.abs(da)<0.35){
+      let steps=Math.max(1, Math.ceil(Math.abs(da)/0.04));
+      let safeCm=Math.min(W.prevScan.dist, curDist);   // KHÔNG vượt vật gần nhất của 2 tia biên
+      let dd=safeCm*PX_PER_CM;
+      for(let s=1;s<steps;s++){
+        let f=s/steps, a=W.prevScan.ang+da*f;
+        castRay(W, W.carX,W.carY, W.carX+dd*Math.cos(a), W.carY+dd*Math.sin(a), false); // chỉ tô trống, tới mức an toàn
+      }
+    }
+  }
+  // tia thực: tô trống dọc đường + đặt vật cản tại điểm chạm
+  let r=curDist*PX_PER_CM;
+  castRay(W, W.carX,W.carY, W.carX+r*Math.cos(beamAng), W.carY+r*Math.sin(beamAng), hit);
+  // CHÙM TIA PHỤ: cảm biến siêu âm/hồng ngoại thật không phải 1 đường kẻ mà là 1 hình nón hẹp.
+  // Tô trống thêm 2 tia lệch +-BEAM_HALF_FOV (không đặt vật cản ở đây, tránh làm dày tường sai lệch)
+  // giúp mỗi lần đo tự phủ rộng hơn, giảm khe hở dạng "kẻ chỉ" giữa các lần quét liên tiếp.
+  for(const off of [-BEAM_HALF_FOV, BEAM_HALF_FOV]){
+    let a=beamAng+off;
+    castRay(W, W.carX,W.carY, W.carX+r*Math.cos(a), W.carY+r*Math.sin(a), false);
+  }
+  W.prevScan={ x:W.carX, y:W.carY, ang:beamAng, dist:curDist };
 }
 
 function drawWorld(ctx, cv, W, view, bg){
   const Wd=cv.width, Ht=cv.height, z=view.zoom*PX_PER_CM;
   const sx=wx=>(wx-view.camX)*z+Wd/2, sy=wy=>(wy-view.camY)*z+Ht/2;
   ctx.clearRect(0,0,Wd,Ht); ctx.fillStyle='#3a4047'; ctx.fillRect(0,0,Wd,Ht);   // nền xám = chưa quét
-  // map nền (nếu nạp) vẽ mờ trước
-  if(bg){ bg.grid.forEach((l,k)=>{ if(l===0)return; let i=k.indexOf(','),cx=+k.slice(0,i),cy=+k.slice(i+1);
-    let px=sx(cx*CELL),py=sy(cy*CELL); if(px<-6||py<-6||px>Wd||py>Ht)return; ctx.globalAlpha=0.35; ctx.fillStyle=loColor(l); ctx.fillRect(px,py,Math.ceil(CELL*view.zoom),Math.ceil(CELL*view.zoom)); ctx.globalAlpha=1; }); }
+  // map nền (nếu nạp) vẽ mờ mượt trước
+  if(bg) drawFreeSmooth(ctx, bg, sx, sy, z, 0.22);
   // lưới 50cm
   ctx.strokeStyle='rgba(0,0,0,0.10)'; ctx.lineWidth=1; let g=50*z;
   if(g>8){ let ox=(Wd/2-view.camX*z)%g, oy=(Ht/2-view.camY*z)%g;
     for(let x=ox;x<Wd;x+=g){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,Ht);ctx.stroke();}
     for(let y=oy;y<Ht;y+=g){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(Wd,y);ctx.stroke();} }
-  // ô vật cản
-  const cs=Math.max(1,Math.ceil(CELL*view.zoom));
-  W.grid.forEach((l,k)=>{ if(l===0)return; let i=k.indexOf(','),cx=+k.slice(0,i),cy=+k.slice(i+1);
-    let px=sx(cx*CELL),py=sy(cy*CELL); if(px<-cs||py<-cs||px>Wd||py>Ht)return; ctx.fillStyle=loColor(l); ctx.fillRect(px,py,cs,cs); });
+  // Vùng TRỐNG (đi được): vẽ MƯỢT thành mảng liền, không thấy ô pixel. Tường hiện ở mép/lõm của vùng trống.
+  drawFreeSmooth(ctx, W, sx, sy, z);
   // quỹ đạo
-  if(W.traj.length>1){ ctx.strokeStyle='rgba(52,211,153,0.55)'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(sx(W.traj[0].x),sy(W.traj[0].y)); for(let p of W.traj)ctx.lineTo(sx(p.x),sy(p.y)); ctx.stroke(); }
+  if(W.traj.length>1){ ctx.strokeStyle='rgba(251,191,36,0.75)'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(sx(W.traj[0].x),sy(W.traj[0].y)); for(let p of W.traj)ctx.lineTo(sx(p.x),sy(p.y)); ctx.stroke(); }
   // tia quét
-  if(W.beam&&W.beam.dist>0){ let bx=sx(W.beam.x),by=sy(W.beam.y),ex=sx(W.beam.x+W.beam.dist*Math.cos(W.beam.ang)*PX_PER_CM),ey=sy(W.beam.y+W.beam.dist*Math.sin(W.beam.ang)*PX_PER_CM); ctx.strokeStyle='rgba(61,139,253,0.5)'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(ex,ey); ctx.stroke(); }
-  // robot
-  let rx=sx(W.carX),ry=sy(W.carY); ctx.fillStyle='#34d399'; ctx.beginPath(); ctx.arc(rx,ry,7,0,6.28); ctx.fill();
-  ctx.strokeStyle='#fff'; ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(rx,ry); ctx.lineTo(rx+18*Math.cos(W.ang),ry+18*Math.sin(W.ang)); ctx.stroke();
+  if(W.beam&&W.beam.dist>0){ let bx=sx(W.beam.x),by=sy(W.beam.y),ex=sx(W.beam.x+W.beam.dist*Math.cos(W.beam.ang)*PX_PER_CM),ey=sy(W.beam.y+W.beam.dist*Math.sin(W.beam.ang)*PX_PER_CM); ctx.strokeStyle='rgba(196,120,255,0.6)'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(ex,ey); ctx.stroke(); }
+  // robot: viền trắng đậm quanh chấm xanh lá để nổi bật rõ trên nền xanh dương + vệt cam
+  let rx=sx(W.carX),ry=sy(W.carY);
+  ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(rx,ry,7,0,6.28); ctx.stroke();
+  ctx.fillStyle='#22c55e'; ctx.beginPath(); ctx.arc(rx,ry,7,0,6.28); ctx.fill();
+  ctx.strokeStyle='#0b3d24'; ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(rx,ry); ctx.lineTo(rx+18*Math.cos(W.ang),ry+18*Math.sin(W.ang)); ctx.stroke();
   // thước 50cm
   let p50=50*z, bx=14, by=Ht-16; ctx.strokeStyle='#1c2128'; ctx.fillStyle='#1c2128'; ctx.lineWidth=2;
   ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(bx+p50,by); ctx.moveTo(bx,by-4); ctx.lineTo(bx,by+4); ctx.moveTo(bx+p50,by-4); ctx.lineTo(bx+p50,by+4); ctx.stroke();
@@ -209,15 +319,15 @@ function connect(){
     const d=m.data; setRobot(true);
     applyFrame(liveW,d);
     document.getElementById('tDist').innerText=(d.dist>0?d.dist.toFixed(0):'--')+' cm';
-    document.getElementById('tMove').innerText='Move: '+(d.mv===1?'TIẾN':d.mv===-1?'LÙI':'quay/dừng');
-    const sf=document.getElementById('tSafe'); if(d.safe===0){sf.innerText='OBSTACLE';sf.className='pill off';}else{sf.innerText='SAFE';sf.className='pill';}
-    const md=document.getElementById('tMode'); md.innerText=d.auto?'AUTO':'MANUAL';
+    const sf=document.getElementById('tSafe'); if(d.safe===0){sf.innerText='vật cản';sf.className='pill off';}else{sf.innerText='an toàn';sf.className='pill';}
     if(d.auto!==undefined && !!d.auto!==autoOn) setAutoUI(d.auto===1);
-    // hiển thị robot đang làm gì
+    // chuyển động / hoạt động auto (text ngắn để không rớt dòng)
+    let mvTxt = d.mv===1?'tiến':d.mv===-1?'lùi':'—';
     if(d.auto && d.ast!==undefined){
-      const A=['đi thẳng','ngó trái','ngó phải','quyết định','lùi','rẽ'];
-      document.getElementById('tMove').innerText='Auto: '+(A[d.ast]||'-');
+      const A=['đi thẳng','ngó trái','ngó phải','quyết định','lùi','rẽ','quét map'];
+      mvTxt=A[d.ast]||'—';
     }
+    document.getElementById('tMove').innerText=mvTxt;
     if(d.spd!==undefined && !spdSynced){ document.getElementById('spd').value=d.spd; document.getElementById('spdVal').innerText=d.spd; spdSynced=true; }
     liveDraw();
   };
@@ -231,7 +341,6 @@ document.querySelectorAll('#dpad .btn').forEach(b=>{ const d=b.dataset.d;
   b.addEventListener('pointerdown',press); b.addEventListener('pointerup',rel); b.addEventListener('pointerleave',rel);
 });
 const spdEl=document.getElementById('spd'); spdEl.oninput=()=>{document.getElementById('spdVal').innerText=spdEl.value; send({cmd:'speed',val:parseInt(spdEl.value)});};
-const trimEl=document.getElementById('trim'); trimEl.oninput=()=>{document.getElementById('trimVal').innerText=trimEl.value; send({cmd:'trim',val:parseInt(trimEl.value)});};
 document.getElementById('liveClear').onclick=()=>{ liveW=newWorld(); liveView.follow=true; liveDraw(); };
 document.getElementById('liveSaveMap').onclick=async()=>{
   const name=prompt('Tên map:', 'Map '+new Date().toLocaleString());
