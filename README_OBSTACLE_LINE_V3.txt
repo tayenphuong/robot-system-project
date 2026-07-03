@@ -1,0 +1,7 @@
+-- lùi 10cm, tốc độ lùi ổn định 
+-- thu nhỏ được độ quét xuống 30cm mới lùi
+-- vẽ them đường line của vật cản 
+-- còn sai tọa độ 
+-- lệch góc quay nhiều trên web nhiều hơn so với thực tế 
+-- tốc độ chạy còn cao, 35 40 thì ok 
+-- chưa test đc auto do quét lúc nào cũng lùi 

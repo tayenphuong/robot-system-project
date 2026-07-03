@@ -1,0 +1,21 @@
+# --- Python (Backend) ---
+__pycache__/
+*.pyc
+.env
+.venv/
+env/
+
+# --- Node.js / React (Frontend) ---
+node_modules/
+dist/
+build/
+.eslintcache
+
+# --- Arduino / C++ (Firmware) ---
+.build/
+local.txt
+*.local.txt
+
+# --- Hệ điều hành ---
+.DS_Store
+Thumbs.db

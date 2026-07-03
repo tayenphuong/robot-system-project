@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#0b0f14" />
+<title>SLAM Robot</title>
+<style>
+  :root{ --bg:#0b0f14; --bg2:#11161d; --panel:#161c25; --line:#252e3a; --txt:#e6edf3; --mut:#8b97a6;
+         --accent:#3d8bfd; --ok:#34d399; --warn:#fbbf24; --bad:#ff5d5d; --mono:ui-monospace,Menlo,Consolas,monospace; }
+  *{ box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body{ margin:0; background:var(--bg); color:var(--txt); font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif; }
+  .top{ display:flex; align-items:center; gap:10px; padding:12px 16px; background:var(--bg2); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:5; }
+  .top b{ font-size:16px; } .top small{ color:var(--mut); font-size:11px; display:block; }
+  .sp{ flex:1; }
+  .pill{ font-family:var(--mono); font-size:12px; padding:4px 9px; border-radius:999px; background:var(--panel); border:1px solid var(--line); white-space:nowrap; }
+  .pill.on{ color:var(--ok); border-color:#1f6b3c; } .pill.off{ color:var(--bad); border-color:#5a2326; }
+  @media (max-width:480px){
+    .top{ padding:10px 12px; gap:6px; } .top b{ font-size:14px; } .top small{ font-size:10px; }
+    .pill{ font-size:11px; padding:3px 7px; }
+    .telg{ gap:5px; } .tabs button{ font-size:13px; padding:10px 0; }
+    .view{ padding:10px; } .btn{ padding:10px 13px; font-size:13px; margin:3px; }
+  }
+  .tabs{ display:flex; background:var(--bg2); border-bottom:1px solid var(--line); }
+  .tabs button{ flex:1; background:none; border:none; color:var(--mut); padding:12px 0; font-size:14px; border-bottom:2px solid transparent; }
+  .tabs button.active{ color:var(--accent); border-bottom-color:var(--accent); }
+  .view{ display:none; padding:14px; } .view.active{ display:block; }
+  .mapWrap{ position:relative; max-width:680px; margin:0 auto; }
+  canvas.map{ width:100%; height:auto; background:#3a4047; border:1px solid var(--line); border-radius:10px; touch-action:none; display:block; }
+  .btn{ padding:11px 16px; margin:4px; border:none; border-radius:9px; background:#222b36; color:#fff; font-size:14px; cursor:pointer; }
+  .btn:active{ background:var(--accent); } .btn.bad{ background:#7f1d1d; } .btn.on{ background:#15803d; } .btn.warn{ background:#854d0e; }
+  .row{ display:flex; flex-wrap:wrap; align-items:center; gap:6px; justify-content:center; }
+  .pad{ text-align:center; margin-top:10px; }
+  .pad .btn{ min-width:64px; font-size:18px; }
+  .card{ background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 14px; margin:10px auto; max-width:680px; }
+  .card h3{ margin:0 0 10px; font-size:13px; color:var(--mut); text-transform:uppercase; letter-spacing:.6px; }
+  input[type=range]{ width:100%; }
+  .slabel{ display:flex; justify-content:space-between; font-size:13px; color:var(--mut); }
+  .list{ max-width:680px; margin:0 auto; }
+  .item{ display:flex; align-items:center; gap:10px; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin-bottom:8px; }
+  .item .meta{ flex:1; font-size:14px; } .item .meta small{ display:block; color:var(--mut); font-family:var(--mono); font-size:12px; }
+  .telg{ display:flex; gap:8px; flex-wrap:wrap; justify-content:center; margin-top:8px; }
+  .empty{ color:var(--mut); text-align:center; padding:30px; }
+</style>
+</head>
+<body>
+  <div class="top">
+    <div><b>SLAM Robot</b><small>điều khiển · xem lại · kho map</small></div>
+    <div class="sp"></div>
+    <div class="pill off" id="robotPill">Robot: offline</div>
+  </div>
+  <div class="tabs">
+    <button class="active" data-t="live">Trực tiếp</button>
+    <button data-t="replay">Xem lại</button>
+    <button data-t="maps">Kho map</button>
+  </div>
+
+  <!-- ============ TRỰC TIẾP ============ -->
+  <div class="view active" id="live">
+    <div class="mapWrap"><canvas class="map" id="liveCanvas" width="680" height="560"></canvas></div>
+    <div class="telg">
+      <span class="pill" id="tDist">-- cm</span>
+      <span class="pill" id="tMove">--</span>
+      <span class="pill" id="tSafe">an toàn</span>
+      <span class="pill" id="tCoord">X:0 Y:0 θ:-90°</span>
+    </div>
+    <div class="pad">
+      <button class="btn" id="autoBtn">🤖 AUTO: OFF</button>
+      <div id="dpad">
+        <div><button class="btn" data-d="f">▲</button></div>
+        <div class="row">
+          <button class="btn" data-d="l">◀</button>
+          <button class="btn bad" data-d="s">■</button>
+          <button class="btn" data-d="r">▶</button>
+        </div>
+        <div><button class="btn" data-d="b">▼</button></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="slabel"><span>Tốc độ</span><b id="spdVal">140</b></div>
+      <input type="range" min="60" max="200" value="140" id="spd">
+      <label style="display:flex; align-items:center; gap:8px; margin-top:10px; font-size:13px; color:var(--mut);">
+        <input type="checkbox" id="exploreChk" style="width:16px; height:16px;">
+        🧭 Khám phá thông minh (web gợi ý hướng dựa vào bản đồ, chỉ hoạt động khi AUTO bật)
+      </label>
+    </div>
+    <div class="row"><button class="btn" id="liveSaveMap">💾 Lưu map hiện tại</button>
+      <button class="btn warn" id="liveResetPos">📍 Đặt robot về gốc (0,0)</button>
+      <button class="btn bad" id="liveClear">Xóa map</button></div>
+  </div>
+
+  <!-- ============ XEM LẠI ============ -->
+  <div class="view" id="replay">
+    <div class="mapWrap"><canvas class="map" id="replayCanvas" width="680" height="560"></canvas></div>
+    <div class="row" style="margin-top:8px;">
+      <button class="btn" id="rpPlay">▶ Phát</button>
+      <span class="pill" id="rpTime">0.0s</span>
+    </div>
+    <input type="range" min="0" max="100" value="0" id="rpSeek" style="max-width:680px; display:block; margin:10px auto;">
+    <div class="row"><span style="color:var(--mut);font-size:13px;">Tốc độ phát:</span>
+      <button class="btn" data-spd="1">1x</button>
+      <button class="btn" data-spd="2">2x</button>
+      <button class="btn" data-spd="4">4x</button>
+    </div>
+    <div class="card"><h3>Các phiên đã ghi</h3><div class="list" id="sesList"><div class="empty">Đang tải…</div></div></div>
+  </div>
+
+  <!-- ============ KHO MAP ============ -->
+  <div class="view" id="maps">
+    <div class="mapWrap"><canvas class="map" id="mapCanvas" width="680" height="560"></canvas></div>
+    <div class="card"><h3>Kho bản đồ</h3>
+      <div class="list" id="mapList"><div class="empty">Đang tải…</div></div>
+    </div>
+  </div>
+
+<script>
+"use strict";
+const PX_PER_CM = 1.5, CELL = 5, L_OCC=0.8, L_FREE=-0.35, L_MIN=-4, L_MAX=4;
+const FREE_FILL='#c7dbd3';
+const BEAM_HALF_FOV = 0.10;
+const OBSTACLE_DETECT_CM = 30;   // <=30cm mới xác định là vật chắn
+const SENSOR_DRAW_MAX_CM = 160;
+const FREE_RAY_CM = 30;          // xa hơn 30cm thì chỉ vẽ vùng trống phía trước
+const OBSTACLE_LINE_CM = 12;      // chiều dài vết gạch vật cản: nhỏ, giống line đường đi
+const HEADING_GAIN = 2.0;          // thực tế quay 180° nhưng web chỉ hiện ~90° -> nhân đôi góc gyro nhận từ ESP32
+
+function newWorld(){ return { grid:new Map(), carX:0, carY:0, ang:-Math.PI/2, traj:[{x:0,y:0}], beam:null, prevScan:null, obstacleLines:[] }; }
+function updateCell(W, cx, cy, d){ let k=cx+','+cy; let v=(W.grid.get(k)||0)+d; W.grid.set(k, Math.max(L_MIN,Math.min(L_MAX,v))); }
+const OCC_SOLID=1.5;
+function castRay(W, x0,y0,x1,y1,hit){
+  let cx0=Math.floor(x0/CELL),cy0=Math.floor(y0/CELL),cx1=Math.floor(x1/CELL),cy1=Math.floor(y1/CELL);
+  let dx=Math.abs(cx1-cx0),dy=Math.abs(cy1-cy0),sx=cx0<cx1?1:-1,sy=cy0<cy1?1:-1,err=dx-dy,cx=cx0,cy=cy0,g=0;
+  while(g++<3000){
+    if(cx===cx1&&cy===cy1)break;
+    if((W.grid.get(cx+','+cy)||0)>=OCC_SOLID) return;
+    updateCell(W,cx,cy,L_FREE);
+    let e2=2*err; if(e2>-dy){err-=dy;cx+=sx;} if(e2<dx){err+=dx;cy+=sy;}
+  }
+  if(hit){
+    let k=cx1+','+cy1, cur=W.grid.get(k)||0;
+    W.grid.set(k, Math.min(L_MAX, Math.max(cur+L_OCC, L_OCC)));
+  } else updateCell(W,cx1,cy1,L_FREE);
+}
+function loColor(l){
+  let p=1-1/(1+Math.exp(l));
+  if(p>=0.5){
+    let t=(p-0.5)*2;
+    return `rgb(${230-30*t|0},${110-70*t|0},${80-50*t|0})`;
+  }
+  let t=(0.5-p)*2;
+  return `rgb(${120+75*t|0},${150+85*t|0},${140+75*t|0})`;
+}
+
+function markOccDisk(W, wx, wy, rcm, boost){
+  const rp=rcm*PX_PER_CM, minX=Math.floor((wx-rp)/CELL), maxX=Math.floor((wx+rp)/CELL);
+  const minY=Math.floor((wy-rp)/CELL), maxY=Math.floor((wy+rp)/CELL);
+  for(let cy=minY; cy<=maxY; cy++) for(let cx=minX; cx<=maxX; cx++){
+    const px=(cx+0.5)*CELL, py=(cy+0.5)*CELL;
+    if(Math.hypot(px-wx, py-wy)<=rp) updateCell(W,cx,cy,boost);
+  }
+}
+function paintObstacleBar(W, robotX, robotY, beamAng, distCm){
+  // Vật cản chỉ được vẽ khi sonar đo <= 30cm.
+  // Mỗi vật cản là 1 vết gạch THẲNG, MỎNG, đặt tại điểm cuối tia siêu âm
+  // và vuông góc với tia quét để nhìn giống mặt chắn/tường nhỏ.
+  if(!(distCm>0) || distCm>OBSTACLE_DETECT_CM) return;
+  const cx=robotX + distCm*PX_PER_CM*Math.cos(beamAng);
+  const cy=robotY + distCm*PX_PER_CM*Math.sin(beamAng);
+  const nx=Math.cos(beamAng+Math.PI/2), ny=Math.sin(beamAng+Math.PI/2);
+  const half=(OBSTACLE_LINE_CM*PX_PER_CM)/2;
+  const line={
+    x1:cx-half*nx, y1:cy-half*ny,
+    x2:cx+half*nx, y2:cy+half*ny
+  };
+  // Tránh spam quá nhiều line trùng nhau khi sonar đứng yên quét lặp tại cùng 1 điểm.
+  const last=W.obstacleLines.length ? W.obstacleLines[W.obstacleLines.length-1] : null;
+  if(!last || Math.hypot(((last.x1+last.x2)/2)-cx, ((last.y1+last.y2)/2)-cy) > 3){
+    W.obstacleLines.push(line);
+    if(W.obstacleLines.length>1200) W.obstacleLines.shift();
+  }
+  // Vẫn đánh dấu occupancy đúng theo vết line để thuật toán map có ô cản, nhưng rất mỏng.
+  const steps=Math.max(3, Math.ceil(OBSTACLE_LINE_CM/2));
+  for(let i=0;i<=steps;i++){
+    const f=i/steps-0.5;
+    const px=cx + f*OBSTACLE_LINE_CM*PX_PER_CM*nx;
+    const py=cy + f*OBSTACLE_LINE_CM*PX_PER_CM*ny;
+    updateCell(W, Math.floor(px/CELL), Math.floor(py/CELL), L_OCC*1.1);
+  }
+}
+
+// Co (erode) rồi giãn (dilate) lại đúng bằng nhau -> loại các gai/tua MỎNG do nhiễu đo dao động
+// (mỗi tia lẻ tạo 1 gai nhỏ), trong khi khối chính (đủ dày) gần như không đổi. Kỹ thuật xử lý ảnh
+// chuẩn ("phép mở" - opening), chỉ ảnh hưởng HIỂN THỊ, không sửa log-odds gốc hay logic né vật.
+function erodeAlpha(a,w,h,need){
+  let out=new Uint8Array(w*h);
+  for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+    let idx=y*w+x;
+    if(!a[idx]) continue;
+    let cnt=0;
+    for(let oy=-1;oy<=1;oy++) for(let ox=-1;ox<=1;ox++){
+      let nx=x+ox,ny=y+oy;
+      if(nx<0||ny<0||nx>=w||ny>=h) continue;   // ngoài biên coi như không trống -> giúp ăn luôn gai sát mép
+      if(a[ny*w+nx]) cnt++;
+    }
+    out[idx]=cnt>=need?1:0;
+  }
+  return out;
+}
+function dilateAlpha(a,w,h){
+  let out=new Uint8Array(w*h);
+  for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+    let idx=y*w+x;
+    if(a[idx]){ out[idx]=1; continue; }
+    let found=false;
+    for(let oy=-1;oy<=1 && !found;oy++) for(let ox=-1;ox<=1;ox++){
+      let nx=x+ox,ny=y+oy;
+      if(nx<0||ny<0||nx>=w||ny>=h) continue;
+      if(a[ny*w+nx]){ found=true; break; }
+    }
+    out[idx]=found?1:0;
+  }
+  return out;
+}
+
+function drawFreeSmooth(ctx, W, sx, sy, z, alpha){
+  let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity,any=false;
+  W.grid.forEach((l,k)=>{ if(l>=0)return; any=true; let i=k.indexOf(','),cx=+k.slice(0,i),cy=+k.slice(i+1);
+    if(cx<minX)minX=cx; if(cx>maxX)maxX=cx; if(cy<minY)minY=cy; if(cy>maxY)maxY=cy; });
+  if(!any) return;
+  let w=maxX-minX+1, h=maxY-minY+1;
+  if(w<1||h<1||w*h>4000000) return;
+  let off=document.createElement('canvas'); off.width=w; off.height=h;
+  let octx=off.getContext('2d'), img=octx.createImageData(w,h);
+  const R=0x8f,G=0xc4,B=0xdb;
+  W.grid.forEach((l,k)=>{ if(l>=0)return; let i=k.indexOf(','),cx=+k.slice(0,i),cy=+k.slice(i+1);
+    let idx=((cy-minY)*w+(cx-minX))*4; img.data[idx]=R; img.data[idx+1]=G; img.data[idx+2]=B; img.data[idx+3]=255; });
+  octx.putImageData(img,0,0);
+  if(w>2 && h>2){
+    let src=img.data, out=octx.createImageData(w,h), dst=out.data;
+    dst.set(src);
+    for(let y=1;y<h-1;y++){
+      for(let x=1;x<w-1;x++){
+        let idx=(y*w+x)*4;
+        if(src[idx+3]!==0) continue;
+        let cnt=0;
+        for(let oy=-1;oy<=1;oy++) for(let ox=-1;ox<=1;ox++){
+          if(ox===0&&oy===0) continue;
+          if(src[((y+oy)*w+(x+ox))*4+3]!==0) cnt++;
+        }
+        if(cnt>=6){ dst[idx]=R; dst[idx+1]=G; dst[idx+2]=B; dst[idx+3]=255; }
+      }
+    }
+    octx.putImageData(out,0,0);
+    // PHÉP MỞ (opening): co rồi giãn để loại gai/tua mỏng do nhiễu đo dao động từng tia lẻ.
+    // need=6/8 nhẹ tay hơn erosion chuẩn (cần đủ 8/8) để không ăn mất hành lang hẹp thật (~15-20cm).
+    let alphaArr=new Uint8Array(w*h);
+    for(let i=0;i<w*h;i++) alphaArr[i]=dst[i*4+3]!==0?1:0;
+    let eroded=erodeAlpha(alphaArr,w,h,6);
+    let opened=dilateAlpha(eroded,w,h);
+    let final=octx.createImageData(w,h);
+    for(let i=0;i<w*h;i++){
+      if(opened[i]){ final.data[i*4]=R; final.data[i*4+1]=G; final.data[i*4+2]=B; final.data[i*4+3]=255; }
+    }
+    octx.putImageData(final,0,0);
+  }
+  let dx=sx(minX*CELL), dy=sy(minY*CELL), dw=w*CELL*z, dh=h*CELL*z;
+  ctx.save(); ctx.imageSmoothingEnabled=true; ctx.imageSmoothingQuality='high';
+  if(alpha!==undefined) ctx.globalAlpha=alpha;
+  ctx.drawImage(off, dx, dy, dw, dh);
+  ctx.restore();
+}
+
+// ================= KHÁM PHÁ THÔNG MINH (Hướng B) =================
+// Tính hướng nên đi tiếp theo dựa trên bản đồ đã quét: quét thử 24 hướng quanh robot (mỗi 15°),
+// với mỗi hướng đi từng bước nhỏ trong vùng ĐÃ BIẾT LÀ TRỐNG; hướng nào chạm phải ô "chưa biết"
+// (chưa từng quét tới) trước khi chạm tường hoặc hết tầm coi là 1 "frontier" (ranh giới đã biết/
+// chưa biết) -- đây chính là hướng đáng đi tới để mở rộng bản đồ. Chọn frontier GẦN NHẤT.
+function normDeg(d){ while(d>180)d-=360; while(d<-180)d+=360; return d; }
+function computeExploreRelDeg(W){
+  const stepCm=6, maxCm=320, nDirs=24;
+  let best=null;
+  for(let i=0;i<nDirs;i++){
+    const ang=(i/nDirs)*2*Math.PI;
+    let d=0, hitFrontier=false;
+    while(d<maxCm){
+      d+=stepCm;
+      const wx=W.carX+d*PX_PER_CM*Math.cos(ang), wy=W.carY+d*PX_PER_CM*Math.sin(ang);
+      const cx=Math.floor(wx/CELL), cy=Math.floor(wy/CELL);
+      const l=W.grid.get(cx+','+cy);
+      if(l===undefined){ hitFrontier=true; break; }   // chưa biết -> đây là 1 frontier
+      if(l>=0) break;                                  // gặp vật cản -> hướng này bí, bỏ qua
+    }
+    if(hitFrontier && (!best || d<best.dist)) best={ang,dist:d};
+  }
+  if(!best) return null;   // đã khám phá hết trong tầm nhìn -> không có gợi ý
+  const targetDeg=best.ang*180/Math.PI, curDeg=W.ang*180/Math.PI;
+  return normDeg(targetDeg-curDeg);
+}
+
+function applyFrame(W, d){
+  let dist = (d.dL!==undefined?d.dL:0) * 0.5 * PX_PER_CM;
+  // ĐẢO DẤU dz: map trước đây hiển thị ngược trái-phải so với thực tế. Về mặt hình học, đảo dấu
+  // TOÀN BỘ góc quay tích lũy từ đầu tương đương lật gương cả quỹ đạo qua trục dọc — đúng là lỗi
+  // "mirror trái-phải" toàn cục (không phải lỗi cục bộ ở 1 chỗ). Nếu sau khi sửa vẫn còn ngược ở
+  // 1 vài chỗ cụ thể (chứ không phải toàn bộ), khả năng cao là do chiều lắp servo cảm biến, cần
+  // xem lại dấu của "(d.ang-90)" thay vì dz.
+  W.ang += (d.dz!==undefined ? -d.dz*HEADING_GAIN*(Math.PI/180.0) : -((d.gz||0)/131.0)*HEADING_GAIN*(Math.PI/180.0)*0.15);
+  W.carX += dist*Math.cos(W.ang); W.carY += dist*Math.sin(W.ang);
+  let last=W.traj[W.traj.length-1];
+  if(Math.hypot(W.carX-last.x,W.carY-last.y)>2) W.traj.push({x:W.carX,y:W.carY});
+
+  let beamAng = W.ang + (((d.ang||90)-90)*Math.PI/180.0);
+  let turning = d.dz!==undefined ? Math.abs(d.dz*HEADING_GAIN) > 6 : Math.abs((d.gz||0)/131*HEADING_GAIN) > 40;
+  let hasMeasure = d.dist>0 && d.dist<SENSOR_DRAW_MAX_CM;
+
+  if(!hasMeasure){
+    W.beam = null;
+    return;
+  }
+
+  // Chỉ khi khoảng cách <=30cm mới coi là vật chắn; xa hơn thì chỉ ray-casting vùng trống.
+  let hit = d.dist<=OBSTACLE_DETECT_CM;
+  let curDist = hit ? d.dist : FREE_RAY_CM;
+  W.beam = { x:W.carX,y:W.carY,ang:beamAng, dist:Math.min(d.dist,SENSOR_DRAW_MAX_CM) };
+
+  if(W.prevScan && !turning){
+    let moved=Math.hypot(W.carX-W.prevScan.x, W.carY-W.prevScan.y);
+    let da=beamAng-W.prevScan.ang; while(da>Math.PI)da-=2*Math.PI; while(da<-Math.PI)da+=2*Math.PI;
+    if(moved<10 && Math.abs(da)<0.35){
+      let steps=Math.max(1, Math.ceil(Math.abs(da)/0.04));
+      let safeCm=Math.min(W.prevScan.dist, curDist);
+      let dd=safeCm*PX_PER_CM;
+      for(let s=1;s<steps;s++){
+        let f=s/steps, a=W.prevScan.ang+da*f;
+        castRay(W, W.carX,W.carY, W.carX+dd*Math.cos(a), W.carY+dd*Math.sin(a), false);
+      }
+    }
+  }
+  let r=curDist*PX_PER_CM;
+  castRay(W, W.carX,W.carY, W.carX+r*Math.cos(beamAng), W.carY+r*Math.sin(beamAng), hit);
+  if(hit) paintObstacleBar(W, W.carX, W.carY, beamAng, curDist);
+  for(const off of [-BEAM_HALF_FOV, BEAM_HALF_FOV]){
+    let a=beamAng+off;
+    castRay(W, W.carX,W.carY, W.carX+r*Math.cos(a), W.carY+r*Math.sin(a), false);
+  }
+  W.prevScan={ x:W.carX, y:W.carY, ang:beamAng, dist:curDist };
+}
+
+function drawWorld(ctx, cv, W, view, bg){
+  const Wd=cv.width, Ht=cv.height, z=view.zoom*PX_PER_CM;
+  const sx=wx=>(wx-view.camX)*z+Wd/2, sy=wy=>(wy-view.camY)*z+Ht/2;
+  ctx.clearRect(0,0,Wd,Ht); ctx.fillStyle='#3a4047'; ctx.fillRect(0,0,Wd,Ht);
+  if(bg) drawFreeSmooth(ctx, bg, sx, sy, z, 0.22);
+  ctx.strokeStyle='rgba(0,0,0,0.10)'; ctx.lineWidth=1; let g=50*z;
+  if(g>8){ let ox=(Wd/2-view.camX*z)%g, oy=(Ht/2-view.camY*z)%g;
+    for(let x=ox;x<Wd;x+=g){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,Ht);ctx.stroke();}
+    for(let y=oy;y<Ht;y+=g){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(Wd,y);ctx.stroke();} }
+  drawFreeSmooth(ctx, W, sx, sy, z);
+  if(W.obstacleLines&&W.obstacleLines.length){
+    ctx.strokeStyle='rgba(255,93,93,0.95)'; ctx.lineWidth=2; ctx.lineCap='round';
+    ctx.beginPath();
+    for(const o of W.obstacleLines){ ctx.moveTo(sx(o.x1),sy(o.y1)); ctx.lineTo(sx(o.x2),sy(o.y2)); }
+    ctx.stroke(); ctx.lineCap='butt';
+  }
+  if(W.traj.length>1){ ctx.strokeStyle='rgba(251,191,36,0.75)'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(sx(W.traj[0].x),sy(W.traj[0].y)); for(let p of W.traj)ctx.lineTo(sx(p.x),sy(p.y)); ctx.stroke(); }
+  if(W.beam&&W.beam.dist>0){ let bx=sx(W.beam.x),by=sy(W.beam.y),ex=sx(W.beam.x+W.beam.dist*Math.cos(W.beam.ang)*PX_PER_CM),ey=sy(W.beam.y+W.beam.dist*Math.sin(W.beam.ang)*PX_PER_CM); ctx.strokeStyle='rgba(196,120,255,0.6)'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(ex,ey); ctx.stroke(); }
+  let rx=sx(W.carX),ry=sy(W.carY);
+  ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(rx,ry,7,0,6.28); ctx.stroke();
+  ctx.fillStyle='#22c55e'; ctx.beginPath(); ctx.arc(rx,ry,7,0,6.28); ctx.fill();
+  ctx.strokeStyle='#0b3d24'; ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(rx,ry); ctx.lineTo(rx+18*Math.cos(W.ang),ry+18*Math.sin(W.ang)); ctx.stroke();
+  ctx.save();
+  ctx.font='12px Arial';
+  ctx.fillStyle='rgba(11,15,20,0.72)';
+  ctx.fillRect(10,10,172,24);
+  ctx.fillStyle='#e6edf3';
+  ctx.fillText(`X:${(W.carX/PX_PER_CM).toFixed(1)}cm  Y:${(W.carY/PX_PER_CM).toFixed(1)}cm  θ:${(W.ang*180/Math.PI).toFixed(0)}°`,16,27);
+  ctx.restore();
+  let p50=50*z, bx=14, by=Ht-16; ctx.strokeStyle='#1c2128'; ctx.fillStyle='#1c2128'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(bx+p50,by); ctx.moveTo(bx,by-4); ctx.lineTo(bx,by+4); ctx.moveTo(bx+p50,by-4); ctx.lineTo(bx+p50,by+4); ctx.stroke();
+  ctx.font='11px Arial'; ctx.fillText('50 cm', bx, by-6);
+}
+
+function attachPanZoom(cv, view, redraw){
+  let drag=false,lx=0,ly=0;
+  const wpx=()=>view.zoom*PX_PER_CM*(cv.clientWidth/cv.width);
+  cv.addEventListener('pointerdown',e=>{drag=true;view.follow=false;lx=e.clientX;ly=e.clientY;cv.setPointerCapture(e.pointerId);});
+  cv.addEventListener('pointermove',e=>{ if(!drag)return; view.camX-=(e.clientX-lx)/wpx(); view.camY-=(e.clientY-ly)/wpx(); lx=e.clientX;ly=e.clientY; redraw(); });
+  cv.addEventListener('pointerup',()=>drag=false);
+  cv.addEventListener('wheel',e=>{e.preventDefault(); view.zoom=Math.max(0.2,Math.min(6,view.zoom*(e.deltaY<0?1.1:0.9))); redraw();},{passive:false});
+}
+
+document.querySelectorAll('.tabs button').forEach(b=>b.addEventListener('click',()=>{
+  const t=b.dataset.t;
+  document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===t));
+  document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('active',x===b));
+  if(t==='replay') loadSessions();
+  if(t==='maps'){ loadMaps(); drawMapsTab(); }
+}));
+
+const liveCv=document.getElementById('liveCanvas'), liveCtx=liveCv.getContext('2d');
+let liveW=newWorld(), liveView={camX:0,camY:0,zoom:1,follow:true}, bgMap=null, autoOn=false, spdSynced=false;
+function liveDraw(){ if(liveView.follow){liveView.camX=liveW.carX;liveView.camY=liveW.carY;} drawWorld(liveCtx,liveCv,liveW,liveView,bgMap); }
+attachPanZoom(liveCv, liveView, liveDraw);
+
+let ws, prevAst=null;
+function wsUrl(){ const p=location.protocol==='https:'?'wss':'ws'; return `${p}://${location.host}/ws/dashboard`; }
+function setRobot(on){ const el=document.getElementById('robotPill'); el.className='pill '+(on?'on':'off'); el.innerText='Robot: '+(on?'online':'offline'); }
+function connect(){
+  ws=new WebSocket(wsUrl());
+  ws.onclose=()=>{ setRobot(false); setTimeout(connect,2000); };
+  ws.onmessage=e=>{ const m=JSON.parse(e.data);
+    if(m.type==='robot_status'){ setRobot(m.online); return; }
+    if(m.type!=='telemetry') return;
+    const d=m.data; setRobot(true);
+    applyFrame(liveW,d);
+    // KHÁM PHÁ THÔNG MINH: đúng lúc robot VỪA chuyển sang trạng thái "quét map" (ast=6, cạnh lên
+    // từ giá trị khác), tính hướng khám phá từ bản đồ hiện có và gửi xuống robot -- kịp trước khi
+    // robot quét xong (SCAN_MS~1.7s) và quyết định có canh hướng hay không.
+    if(document.getElementById('exploreChk').checked && d.ast===6 && prevAst!==6){
+      const rel=computeExploreRelDeg(liveW);
+      if(rel!==null) send({cmd:'goto', rel_deg: Math.round(rel*10)/10});
+    }
+    prevAst=d.ast;
+    document.getElementById('tDist').innerText=(d.dist>0?d.dist.toFixed(0):'--')+' cm';
+    const sf=document.getElementById('tSafe'); if(d.safe===0){sf.innerText='vật cản';sf.className='pill off';}else{sf.innerText='an toàn';sf.className='pill';}
+    if(d.auto!==undefined && !!d.auto!==autoOn) setAutoUI(d.auto===1);
+    let mvTxt = d.mv===1?'tiến':d.mv===-1?'lùi':'—';
+    if(d.auto && d.ast!==undefined){
+      const A=['đi thẳng','ngó trái','ngó phải','quyết định','lùi','rẽ','quét map','canh hướng'];
+      mvTxt=A[d.ast]||'—';
+    }
+    document.getElementById('tMove').innerText=mvTxt;
+    document.getElementById('tCoord').innerText=`X:${(liveW.carX/PX_PER_CM).toFixed(1)} Y:${(liveW.carY/PX_PER_CM).toFixed(1)} θ:${(liveW.ang*180/Math.PI).toFixed(0)}°`;
+    if(d.spd!==undefined && !spdSynced){ document.getElementById('spd').value=d.spd; document.getElementById('spdVal').innerText=d.spd; spdSynced=true; }
+    liveDraw();
+  };
+}
+function send(o){ if(ws&&ws.readyState===1) ws.send(JSON.stringify(o)); }
+function setAutoUI(on){ autoOn=on; const b=document.getElementById('autoBtn'); b.innerText=on?'🤖 AUTO: ON':'🤖 AUTO: OFF'; b.className=on?'btn on':'btn'; }
+document.getElementById('autoBtn').onclick=()=>{ setAutoUI(!autoOn); send({cmd:'a',st:autoOn?1:0}); };
+document.querySelectorAll('#dpad .btn').forEach(b=>{ const d=b.dataset.d;
+  const press=e=>{
+    e.preventDefault();
+    if(d!=='s' && autoOn){ setAutoUI(false); send({cmd:'a',st:0}); }
+    send({cmd:d,st:1});
+  };
+  const rel=e=>{ if(e)e.preventDefault(); if(d!=='s') send({cmd:d,st:0}); };
+  b.addEventListener('pointerdown',press); b.addEventListener('pointerup',rel); b.addEventListener('pointerleave',rel);
+});
+const spdEl=document.getElementById('spd'); spdEl.oninput=()=>{document.getElementById('spdVal').innerText=spdEl.value; send({cmd:'speed',val:parseInt(spdEl.value)});};
+document.getElementById('liveClear').onclick=()=>{ liveW=newWorld(); liveView.follow=true; liveDraw(); };
+document.getElementById('liveResetPos').onclick=()=>{
+  if(!confirm('Đặt robot về vị trí gốc (0,0), giữ nguyên map đã quét?')) return;
+  liveW.carX=0; liveW.carY=0; liveW.ang=-Math.PI/2;
+  liveW.traj.push({x:0,y:0});
+  liveW.prevScan=null;
+  liveView.follow=true; liveDraw();
+};
+document.getElementById('liveSaveMap').onclick=async()=>{
+  const name=prompt('Tên map:', 'Map '+new Date().toLocaleString());
+  if(!name) return;
+  const cells=Array.from(liveW.grid.entries()).map(([k,l])=>{let i=k.indexOf(',');return [+k.slice(0,i),+k.slice(i+1),Math.round(l*100)/100];});
+  await fetch('/api/maps',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name, data:{cells, traj:liveW.traj, obstacleLines:liveW.obstacleLines}})});
+  alert('Đã lưu map "'+name+'" vào kho.');
+};
+
+const rpCv=document.getElementById('replayCanvas'), rpCtx=rpCv.getContext('2d');
+let rpW=newWorld(), rpView={camX:0,camY:0,zoom:1,follow:true};
+let rpFrames=[], rpIdx=0, rpPlaying=false, rpSpeed=1, rpTimer=null, rpT0=0;
+function rpDraw(){ if(rpView.follow){rpView.camX=rpW.carX;rpView.camY=rpW.carY;} drawWorld(rpCtx,rpCv,rpW,rpView,null); }
+attachPanZoom(rpCv, rpView, rpDraw);
+
+async function loadSessions(){
+  const list=document.getElementById('sesList'); list.innerHTML='<div class="empty">Đang tải…</div>';
+  try{
+    const ss=await (await fetch('/api/sessions')).json();
+    if(!ss.length){ list.innerHTML='<div class="empty">Chưa có phiên nào. Hãy chạy robot một lần.</div>'; return; }
+    list.innerHTML='';
+    ss.forEach(s=>{ const div=document.createElement('div'); div.className='item';
+      div.innerHTML=`<div class="meta">${s.id}<small>${s.duration_s}s · ${s.frames} khung</small></div>`;
+      const open=document.createElement('button'); open.className='btn'; open.innerText='Mở'; open.onclick=()=>openSession(s.id);
+      const del=document.createElement('button'); del.className='btn bad'; del.innerText='Xóa';
+      del.onclick=async()=>{ await fetch('/api/sessions/'+s.id,{method:'DELETE'}); loadSessions(); };
+      div.appendChild(open); div.appendChild(del); list.appendChild(div); });
+  }catch(e){ list.innerHTML='<div class="empty">Không tải được danh sách.</div>'; }
+}
+async function openSession(id){
+  const ses=await (await fetch('/api/sessions/'+id)).json();
+  rpFrames=ses.frames||[]; rpIdx=0; rpW=newWorld(); rpView.follow=true;
+  document.getElementById('rpSeek').max=Math.max(0,rpFrames.length-1);
+  document.getElementById('rpSeek').value=0;
+  rpStop(); rebuildTo(0); rpDraw();
+}
+function rebuildTo(idx){
+  rpW=newWorld();
+  for(let i=0;i<=idx && i<rpFrames.length;i++) applyFrame(rpW, rpFrames[i]);
+  rpIdx=idx;
+  const t=rpFrames[idx]? (rpFrames[idx]._t||0)/1000 : 0;
+  document.getElementById('rpTime').innerText=t.toFixed(1)+'s';
+  document.getElementById('rpSeek').value=idx;
+}
+function rpStep(){
+  if(!rpPlaying||!rpFrames.length) return;
+  const now=performance.now(); const elapsed=(now-rpT0)*rpSpeed;
+  const baseT=rpFrames[rpIdx]?(rpFrames[rpIdx]._t||0):0;
+  let j=rpIdx;
+  while(j+1<rpFrames.length && ((rpFrames[j+1]._t||0)-baseT)<=elapsed){ j++; applyFrame(rpW,rpFrames[j]); }
+  if(j!==rpIdx){ rpIdx=j; document.getElementById('rpSeek').value=j; document.getElementById('rpTime').innerText=((rpFrames[j]._t||0)/1000).toFixed(1)+'s'; rpDraw(); rpT0=now; }
+  if(rpIdx>=rpFrames.length-1){ rpStop(); }
+}
+function rpPlay(){ if(!rpFrames.length)return; if(rpIdx>=rpFrames.length-1) rebuildTo(0); rpPlaying=true; rpT0=performance.now(); document.getElementById('rpPlay').innerText='⏸ Dừng'; rpTimer=setInterval(rpStep,50); }
+function rpStop(){ rpPlaying=false; if(rpTimer)clearInterval(rpTimer); document.getElementById('rpPlay').innerText='▶ Phát'; }
+document.getElementById('rpPlay').onclick=()=>{ rpPlaying?rpStop():rpPlay(); };
+document.getElementById('rpSeek').oninput=e=>{ rpStop(); rebuildTo(parseInt(e.target.value)); rpDraw(); };
+document.querySelectorAll('[data-spd]').forEach(b=>b.onclick=()=>{ rpSpeed=parseFloat(b.dataset.spd); rpT0=performance.now(); });
+
+const mpCv=document.getElementById('mapCanvas'), mpCtx=mpCv.getContext('2d');
+let mpW=newWorld(), mpView={camX:0,camY:0,zoom:1,follow:false};
+function drawMapsTab(){ drawWorld(mpCtx,mpCv,mpW,mpView,null); }
+attachPanZoom(mpCv, mpView, drawMapsTab);
+async function loadMaps(){
+  const list=document.getElementById('mapList'); list.innerHTML='<div class="empty">Đang tải…</div>';
+  try{
+    const ms=await (await fetch('/api/maps')).json();
+    if(!ms.length){ list.innerHTML='<div class="empty">Kho trống. Lưu map từ tab Trực tiếp.</div>'; return; }
+    list.innerHTML='';
+    ms.forEach(m=>{ const div=document.createElement('div'); div.className='item';
+      div.innerHTML=`<div class="meta">${m.name}<small>${new Date(m.created*1000).toLocaleString()}</small></div>`;
+      const view=document.createElement('button'); view.className='btn'; view.innerText='Xem'; view.onclick=()=>showMap(m.id);
+      const useBg=document.createElement('button'); useBg.className='btn warn'; useBg.innerText='Dùng làm nền'; useBg.onclick=()=>useAsBackground(m.id);
+      const del=document.createElement('button'); del.className='btn bad'; del.innerText='Xóa'; del.onclick=async()=>{ await fetch('/api/maps/'+m.id,{method:'DELETE'}); loadMaps(); };
+      div.appendChild(view); div.appendChild(useBg); div.appendChild(del); list.appendChild(div); });
+  }catch(e){ list.innerHTML='<div class="empty">Không tải được.</div>'; }
+}
+function gridFromCells(cells){ const W=newWorld(); (cells||[]).forEach(([cx,cy,l])=>W.grid.set(cx+','+cy,l)); return W; }
+function worldFromMapData(data){ const W=gridFromCells(data&&data.cells); if(data&&data.traj) W.traj=data.traj; if(data&&data.obstacleLines) W.obstacleLines=data.obstacleLines; return W; }
+async function showMap(id){
+  const m=await (await fetch('/api/maps/'+id)).json();
+  mpW=worldFromMapData(m.data);
+  mpView.follow=false; mpView.camX=0; mpView.camY=0; drawMapsTab();
+}
+async function useAsBackground(id){
+  const m=await (await fetch('/api/maps/'+id)).json();
+  bgMap=worldFromMapData(m.data);
+  alert('Đã đặt làm nền cho tab Trực tiếp. Robot sẽ quét chồng lên nền này.');
+  liveDraw();
+}
+
+connect(); liveDraw();
+</script>
+</body>
+</html>
