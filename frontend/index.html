@@ -78,8 +78,13 @@
     <div class="card">
       <div class="slabel"><span>Tốc độ</span><b id="spdVal">140</b></div>
       <input type="range" min="60" max="200" value="140" id="spd">
+      <label style="display:flex; align-items:center; gap:8px; margin-top:10px; font-size:13px; color:var(--mut);">
+        <input type="checkbox" id="exploreChk" style="width:16px; height:16px;">
+        🧭 Khám phá thông minh (web gợi ý hướng dựa vào bản đồ, chỉ hoạt động khi AUTO bật)
+      </label>
     </div>
     <div class="row"><button class="btn" id="liveSaveMap">💾 Lưu map hiện tại</button>
+      <button class="btn warn" id="liveResetPos">📍 Đặt robot về gốc (0,0)</button>
       <button class="btn bad" id="liveClear">Xóa map</button></div>
   </div>
 
@@ -109,45 +114,71 @@
 
 <script>
 "use strict";
-// L_OCC giảm từ 1.2 -> 0.8: MỘT lần chạm không còn đủ để ô trở thành "tường chắc" ngay lập tức.
-// OCC_SOLID tăng lên 1.5: cần ~2 lần chạm liên tiếp cùng chỗ mới bị coi là chắc chắn -> tia mới bị chặn.
-// Trước đây 1 tiếng "dội" nhiễu (rất hay gặp với cảm biến siêu âm) đã tạo tường ảo, tường ảo này
-// chặn hết các tia quét sau đi ngang qua -> để lại vùng "chưa quét" (lỗ đen) phía sau nó mãi mãi.
 const PX_PER_CM = 1.5, CELL = 5, L_OCC=0.8, L_FREE=-0.35, L_MIN=-4, L_MAX=4;
-const FREE_FILL='#c7dbd3';   // màu đồng nhất cho vùng đi được (nối liền, không viền pixel)
-const BEAM_HALF_FOV = 0.10;  // ~11° mỗi bên: mô phỏng góc mở thật của cảm biến siêu âm/hồng ngoại
+const FREE_FILL='#c7dbd3';
+const BEAM_HALF_FOV = 0.10;
 
-// ---------- lõi bản đồ (dùng chung cho Live/Replay/Maps) ----------
 function newWorld(){ return { grid:new Map(), carX:0, carY:0, ang:-Math.PI/2, traj:[{x:0,y:0}], beam:null, prevScan:null }; }
 function updateCell(W, cx, cy, d){ let k=cx+','+cy; let v=(W.grid.get(k)||0)+d; W.grid.set(k, Math.max(L_MIN,Math.min(L_MAX,v))); }
-const OCC_SOLID=1.5;   // ô >= mức này coi là tường chắc -> tia tô-trống KHÔNG xuyên qua
+const OCC_SOLID=1.5;
 function castRay(W, x0,y0,x1,y1,hit){
   let cx0=Math.floor(x0/CELL),cy0=Math.floor(y0/CELL),cx1=Math.floor(x1/CELL),cy1=Math.floor(y1/CELL);
   let dx=Math.abs(cx1-cx0),dy=Math.abs(cy1-cy0),sx=cx0<cx1?1:-1,sy=cy0<cy1?1:-1,err=dx-dy,cx=cx0,cy=cy0,g=0;
   while(g++<3000){
     if(cx===cx1&&cy===cy1)break;
-    if((W.grid.get(cx+','+cy)||0)>=OCC_SOLID) return;   // gặp tường chắc -> dừng, không đào xuyên
+    if((W.grid.get(cx+','+cy)||0)>=OCC_SOLID) return;
     updateCell(W,cx,cy,L_FREE);
     let e2=2*err; if(e2>-dy){err-=dy;cx+=sx;} if(e2<dx){err+=dx;cy+=sy;}
   }
-  if(hit){ // chạm vật -> LẬT ô thành vật cản NGAY (kể cả nơi từng tô trống) để hiện chỗ chắn
+  if(hit){
     let k=cx1+','+cy1, cur=W.grid.get(k)||0;
     W.grid.set(k, Math.min(L_MAX, Math.max(cur+L_OCC, L_OCC)));
   } else updateCell(W,cx1,cy1,L_FREE);
 }
 function loColor(l){
-  // p = xác suất là VẬT CẢN (0..1).  l<0 -> trống (đi được),  l>0 -> vật cản
   let p=1-1/(1+Math.exp(l));
-  if(p>=0.5){ // vật cản: cam -> đỏ đậm theo độ chắc chắn
+  if(p>=0.5){
     let t=(p-0.5)*2;
     return `rgb(${230-30*t|0},${110-70*t|0},${80-50*t|0})`;
   }
-  // vùng trống / đi được: xám-xanh -> xanh trắng SÁNG (nổi trên nền xám)
   let t=(0.5-p)*2;
   return `rgb(${120+75*t|0},${150+85*t|0},${140+75*t|0})`;
 }
 
-// Vẽ vùng TRỐNG mượt: dựng ảnh ở độ phân giải ô rồi phóng to có làm mịn -> mảng liền, không thấy ô pixel
+// Co (erode) rồi giãn (dilate) lại đúng bằng nhau -> loại các gai/tua MỎNG do nhiễu đo dao động
+// (mỗi tia lẻ tạo 1 gai nhỏ), trong khi khối chính (đủ dày) gần như không đổi. Kỹ thuật xử lý ảnh
+// chuẩn ("phép mở" - opening), chỉ ảnh hưởng HIỂN THỊ, không sửa log-odds gốc hay logic né vật.
+function erodeAlpha(a,w,h,need){
+  let out=new Uint8Array(w*h);
+  for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+    let idx=y*w+x;
+    if(!a[idx]) continue;
+    let cnt=0;
+    for(let oy=-1;oy<=1;oy++) for(let ox=-1;ox<=1;ox++){
+      let nx=x+ox,ny=y+oy;
+      if(nx<0||ny<0||nx>=w||ny>=h) continue;   // ngoài biên coi như không trống -> giúp ăn luôn gai sát mép
+      if(a[ny*w+nx]) cnt++;
+    }
+    out[idx]=cnt>=need?1:0;
+  }
+  return out;
+}
+function dilateAlpha(a,w,h){
+  let out=new Uint8Array(w*h);
+  for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+    let idx=y*w+x;
+    if(a[idx]){ out[idx]=1; continue; }
+    let found=false;
+    for(let oy=-1;oy<=1 && !found;oy++) for(let ox=-1;ox<=1;ox++){
+      let nx=x+ox,ny=y+oy;
+      if(nx<0||ny<0||nx>=w||ny>=h) continue;
+      if(a[ny*w+nx]){ found=true; break; }
+    }
+    out[idx]=found?1:0;
+  }
+  return out;
+}
+
 function drawFreeSmooth(ctx, W, sx, sy, z, alpha){
   let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity,any=false;
   W.grid.forEach((l,k)=>{ if(l>=0)return; any=true; let i=k.indexOf(','),cx=+k.slice(0,i),cy=+k.slice(i+1);
@@ -157,20 +188,17 @@ function drawFreeSmooth(ctx, W, sx, sy, z, alpha){
   if(w<1||h<1||w*h>4000000) return;
   let off=document.createElement('canvas'); off.width=w; off.height=h;
   let octx=off.getContext('2d'), img=octx.createImageData(w,h);
-  const R=0x8f,G=0xc4,B=0xdb;   // xanh dương nhạt cho vùng đã quét/đi được, tách biệt hẳn với màu xanh lá của robot
+  const R=0x8f,G=0xc4,B=0xdb;
   W.grid.forEach((l,k)=>{ if(l>=0)return; let i=k.indexOf(','),cx=+k.slice(0,i),cy=+k.slice(i+1);
     let idx=((cy-minY)*w+(cx-minX))*4; img.data[idx]=R; img.data[idx+1]=G; img.data[idx+2]=B; img.data[idx+3]=255; });
   octx.putImageData(img,0,0);
-  // VÁ LỖ NHỎ: nếu 1 ô "chưa quét" (alpha=0) bị bao quanh phần lớn bởi ô trống (alpha=255),
-  // tô luôn nó thành trống để loại các đốm lỗ lẻ tẻ (do tia quét bỏ sót 1-2 ô). Chỉ ảnh hưởng
-  // hiển thị, KHÔNG sửa dữ liệu log-odds gốc trong W.grid.
   if(w>2 && h>2){
     let src=img.data, out=octx.createImageData(w,h), dst=out.data;
     dst.set(src);
     for(let y=1;y<h-1;y++){
       for(let x=1;x<w-1;x++){
         let idx=(y*w+x)*4;
-        if(src[idx+3]!==0) continue; // đã trống rồi, bỏ qua
+        if(src[idx+3]!==0) continue;
         let cnt=0;
         for(let oy=-1;oy<=1;oy++) for(let ox=-1;ox<=1;ox++){
           if(ox===0&&oy===0) continue;
@@ -180,6 +208,17 @@ function drawFreeSmooth(ctx, W, sx, sy, z, alpha){
       }
     }
     octx.putImageData(out,0,0);
+    // PHÉP MỞ (opening): co rồi giãn để loại gai/tua mỏng do nhiễu đo dao động từng tia lẻ.
+    // need=6/8 nhẹ tay hơn erosion chuẩn (cần đủ 8/8) để không ăn mất hành lang hẹp thật (~15-20cm).
+    let alphaArr=new Uint8Array(w*h);
+    for(let i=0;i<w*h;i++) alphaArr[i]=dst[i*4+3]!==0?1:0;
+    let eroded=erodeAlpha(alphaArr,w,h,6);
+    let opened=dilateAlpha(eroded,w,h);
+    let final=octx.createImageData(w,h);
+    for(let i=0;i<w*h;i++){
+      if(opened[i]){ final.data[i*4]=R; final.data[i*4+1]=G; final.data[i*4+2]=B; final.data[i*4+3]=255; }
+    }
+    octx.putImageData(final,0,0);
   }
   let dx=sx(minX*CELL), dy=sy(minY*CELL), dw=w*CELL*z, dh=h*CELL*z;
   ctx.save(); ctx.imageSmoothingEnabled=true; ctx.imageSmoothingQuality='high';
@@ -188,65 +227,73 @@ function drawFreeSmooth(ctx, W, sx, sy, z, alpha){
   ctx.restore();
 }
 
-// áp 1 khung telemetry vào world (dùng cho cả trực tiếp lẫn xem lại)
+// ================= KHÁM PHÁ THÔNG MINH (Hướng B) =================
+// Tính hướng nên đi tiếp theo dựa trên bản đồ đã quét: quét thử 24 hướng quanh robot (mỗi 15°),
+// với mỗi hướng đi từng bước nhỏ trong vùng ĐÃ BIẾT LÀ TRỐNG; hướng nào chạm phải ô "chưa biết"
+// (chưa từng quét tới) trước khi chạm tường hoặc hết tầm coi là 1 "frontier" (ranh giới đã biết/
+// chưa biết) -- đây chính là hướng đáng đi tới để mở rộng bản đồ. Chọn frontier GẦN NHẤT.
+function normDeg(d){ while(d>180)d-=360; while(d<-180)d+=360; return d; }
+function computeExploreRelDeg(W){
+  const stepCm=6, maxCm=320, nDirs=24;
+  let best=null;
+  for(let i=0;i<nDirs;i++){
+    const ang=(i/nDirs)*2*Math.PI;
+    let d=0, hitFrontier=false;
+    while(d<maxCm){
+      d+=stepCm;
+      const wx=W.carX+d*PX_PER_CM*Math.cos(ang), wy=W.carY+d*PX_PER_CM*Math.sin(ang);
+      const cx=Math.floor(wx/CELL), cy=Math.floor(wy/CELL);
+      const l=W.grid.get(cx+','+cy);
+      if(l===undefined){ hitFrontier=true; break; }   // chưa biết -> đây là 1 frontier
+      if(l>=0) break;                                  // gặp vật cản -> hướng này bí, bỏ qua
+    }
+    if(hitFrontier && (!best || d<best.dist)) best={ang,dist:d};
+  }
+  if(!best) return null;   // đã khám phá hết trong tầm nhìn -> không có gợi ý
+  const targetDeg=best.ang*180/Math.PI, curDeg=W.ang*180/Math.PI;
+  return normDeg(targetDeg-curDeg);
+}
+
 function applyFrame(W, d){
-  let mv = (d.mv===undefined)?1:d.mv;
-  let dist = (d.dL!==undefined?d.dL:0) * 0.5 * PX_PER_CM * mv;
-  W.ang += (d.dz!==undefined ? d.dz*(Math.PI/180.0) : ((d.gz||0)/131.0)*(Math.PI/180.0)*0.15);
+  let dist = (d.dL!==undefined?d.dL:0) * 0.5 * PX_PER_CM;
+  // ĐẢO DẤU dz: map trước đây hiển thị ngược trái-phải so với thực tế. Về mặt hình học, đảo dấu
+  // TOÀN BỘ góc quay tích lũy từ đầu tương đương lật gương cả quỹ đạo qua trục dọc — đúng là lỗi
+  // "mirror trái-phải" toàn cục (không phải lỗi cục bộ ở 1 chỗ). Nếu sau khi sửa vẫn còn ngược ở
+  // 1 vài chỗ cụ thể (chứ không phải toàn bộ), khả năng cao là do chiều lắp servo cảm biến, cần
+  // xem lại dấu của "(d.ang-90)" thay vì dz.
+  W.ang += (d.dz!==undefined ? -d.dz*(Math.PI/180.0) : -((d.gz||0)/131.0)*(Math.PI/180.0)*0.15);
   W.carX += dist*Math.cos(W.ang); W.carY += dist*Math.sin(W.ang);
   let last=W.traj[W.traj.length-1];
   if(Math.hypot(W.carX-last.x,W.carY-last.y)>2) W.traj.push({x:W.carX,y:W.carY});
 
   let beamAng = W.ang + (((d.ang||90)-90)*Math.PI/180.0);
-  let turning = d.dz!==undefined ? Math.abs(d.dz) > 6 : Math.abs((d.gz||0)/131) > 40;          // xoay nhanh -> đo dễ nhòe, bỏ điểm vật (lọc nhiễu)
+  let turning = d.dz!==undefined ? Math.abs(d.dz) > 6 : Math.abs((d.gz||0)/131) > 40;
   let hasHit = d.dist>0 && d.dist<120;
 
   if(!hasHit){
-    // KHÔNG có echo hợp lệ (rất hay xảy ra khi tia gặp tường/góc nghiêng, âm/tia phản xạ chéo
-    // đi hướng khác không dội thẳng về cảm biến) -> TUYỆT ĐỐI không giả định "trống" ở đây.
-    // Trước đây code mặc định coi như trống tới 100cm, khiến mỗi lần "mù" lại tô 1 vệt trống
-    // xuyên qua tường thật -> tạo các "răng" lồi ra ngoài viền tường (đúng như trong ảnh chữ L).
-    // Giải pháp: bỏ qua cập nhật occupancy của khung này, coi vùng đó là "chưa biết" (màu xám),
-    // để lần quét khác (góc khác, vị trí khác) tự xác nhận sau.
     W.beam = null;
     return;
   }
 
   let curDist = Math.min(d.dist,100);
-  // Trước đây có "&& !turning" ở đây khiến MỌI lần chạm vật trong lúc thân robot đang xoay
-  // đều bị bỏ qua, không bao giờ ghi nhận tường. Giờ đã yêu cầu ~2 lần chạm mới thành tường
-  // chắc (OCC_SOLID) nên không còn sợ 1 lần nhiễu lúc xoay tạo tường ảo -> cho ghi nhận lại,
-  // để các góc chỉ "thấy" được trong lúc xoay (như góc lõm chữ L) vẫn có cơ hội được xác nhận.
   let hit = d.dist<100;
   W.beam = { x:W.carX,y:W.carY,ang:beamAng, dist:d.dist };
 
-  // LẤP QUẠT: chỉ nội suy lấp trống khi THÂN ROBOT ĐỨNG YÊN và chỉ servo tự quét (đúng mục
-  // đích ban đầu: lấp khe hở nhỏ giữa các bước servo liền kề, VÀI ĐỘ một). Khi thân đang XOAY
-  // (turning=true), TUYỆT ĐỐI không lấp: nếu 2 lần đo liền kề vô tình nằm ở 2 bên một góc lõm
-  // (như góc trong của chữ L), nội suy sẽ "vá phẳng" luôn góc lõm đó thành 1 cung tròn, biến
-  // cả phòng chữ L thành hình tròn -- đây chính là lỗi bạn gặp. Thà để trống (màu xám, chưa
-  // biết) còn hơn đoán bừa nối liền 2 điểm xa nhau khi đang xoay.
-  // Ngưỡng góc cũng thu hẹp lại (còn ~0.35 rad ~20°) vì giờ dz đã chính xác, không cần nới
-  // rộng để bù sai số thời gian như trước nữa.
   if(W.prevScan && !turning){
     let moved=Math.hypot(W.carX-W.prevScan.x, W.carY-W.prevScan.y);
     let da=beamAng-W.prevScan.ang; while(da>Math.PI)da-=2*Math.PI; while(da<-Math.PI)da+=2*Math.PI;
     if(moved<10 && Math.abs(da)<0.35){
       let steps=Math.max(1, Math.ceil(Math.abs(da)/0.04));
-      let safeCm=Math.min(W.prevScan.dist, curDist);   // KHÔNG vượt vật gần nhất của 2 tia biên
+      let safeCm=Math.min(W.prevScan.dist, curDist);
       let dd=safeCm*PX_PER_CM;
       for(let s=1;s<steps;s++){
         let f=s/steps, a=W.prevScan.ang+da*f;
-        castRay(W, W.carX,W.carY, W.carX+dd*Math.cos(a), W.carY+dd*Math.sin(a), false); // chỉ tô trống, tới mức an toàn
+        castRay(W, W.carX,W.carY, W.carX+dd*Math.cos(a), W.carY+dd*Math.sin(a), false);
       }
     }
   }
-  // tia thực: tô trống dọc đường + đặt vật cản tại điểm chạm
   let r=curDist*PX_PER_CM;
   castRay(W, W.carX,W.carY, W.carX+r*Math.cos(beamAng), W.carY+r*Math.sin(beamAng), hit);
-  // CHÙM TIA PHỤ: cảm biến siêu âm/hồng ngoại thật không phải 1 đường kẻ mà là 1 hình nón hẹp.
-  // Tô trống thêm 2 tia lệch +-BEAM_HALF_FOV (không đặt vật cản ở đây, tránh làm dày tường sai lệch)
-  // giúp mỗi lần đo tự phủ rộng hơn, giảm khe hở dạng "kẻ chỉ" giữa các lần quét liên tiếp.
   for(const off of [-BEAM_HALF_FOV, BEAM_HALF_FOV]){
     let a=beamAng+off;
     castRay(W, W.carX,W.carY, W.carX+r*Math.cos(a), W.carY+r*Math.sin(a), false);
@@ -257,32 +304,24 @@ function applyFrame(W, d){
 function drawWorld(ctx, cv, W, view, bg){
   const Wd=cv.width, Ht=cv.height, z=view.zoom*PX_PER_CM;
   const sx=wx=>(wx-view.camX)*z+Wd/2, sy=wy=>(wy-view.camY)*z+Ht/2;
-  ctx.clearRect(0,0,Wd,Ht); ctx.fillStyle='#3a4047'; ctx.fillRect(0,0,Wd,Ht);   // nền xám = chưa quét
-  // map nền (nếu nạp) vẽ mờ mượt trước
+  ctx.clearRect(0,0,Wd,Ht); ctx.fillStyle='#3a4047'; ctx.fillRect(0,0,Wd,Ht);
   if(bg) drawFreeSmooth(ctx, bg, sx, sy, z, 0.22);
-  // lưới 50cm
   ctx.strokeStyle='rgba(0,0,0,0.10)'; ctx.lineWidth=1; let g=50*z;
   if(g>8){ let ox=(Wd/2-view.camX*z)%g, oy=(Ht/2-view.camY*z)%g;
     for(let x=ox;x<Wd;x+=g){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,Ht);ctx.stroke();}
     for(let y=oy;y<Ht;y+=g){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(Wd,y);ctx.stroke();} }
-  // Vùng TRỐNG (đi được): vẽ MƯỢT thành mảng liền, không thấy ô pixel. Tường hiện ở mép/lõm của vùng trống.
   drawFreeSmooth(ctx, W, sx, sy, z);
-  // quỹ đạo
   if(W.traj.length>1){ ctx.strokeStyle='rgba(251,191,36,0.75)'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(sx(W.traj[0].x),sy(W.traj[0].y)); for(let p of W.traj)ctx.lineTo(sx(p.x),sy(p.y)); ctx.stroke(); }
-  // tia quét
   if(W.beam&&W.beam.dist>0){ let bx=sx(W.beam.x),by=sy(W.beam.y),ex=sx(W.beam.x+W.beam.dist*Math.cos(W.beam.ang)*PX_PER_CM),ey=sy(W.beam.y+W.beam.dist*Math.sin(W.beam.ang)*PX_PER_CM); ctx.strokeStyle='rgba(196,120,255,0.6)'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(ex,ey); ctx.stroke(); }
-  // robot: viền trắng đậm quanh chấm xanh lá để nổi bật rõ trên nền xanh dương + vệt cam
   let rx=sx(W.carX),ry=sy(W.carY);
   ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(rx,ry,7,0,6.28); ctx.stroke();
   ctx.fillStyle='#22c55e'; ctx.beginPath(); ctx.arc(rx,ry,7,0,6.28); ctx.fill();
   ctx.strokeStyle='#0b3d24'; ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(rx,ry); ctx.lineTo(rx+18*Math.cos(W.ang),ry+18*Math.sin(W.ang)); ctx.stroke();
-  // thước 50cm
   let p50=50*z, bx=14, by=Ht-16; ctx.strokeStyle='#1c2128'; ctx.fillStyle='#1c2128'; ctx.lineWidth=2;
   ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(bx+p50,by); ctx.moveTo(bx,by-4); ctx.lineTo(bx,by+4); ctx.moveTo(bx+p50,by-4); ctx.lineTo(bx+p50,by+4); ctx.stroke();
   ctx.font='11px Arial'; ctx.fillText('50 cm', bx, by-6);
 }
 
-// pan/zoom đơn giản cho 1 canvas + view
 function attachPanZoom(cv, view, redraw){
   let drag=false,lx=0,ly=0;
   const wpx=()=>view.zoom*PX_PER_CM*(cv.clientWidth/cv.width);
@@ -292,7 +331,6 @@ function attachPanZoom(cv, view, redraw){
   cv.addEventListener('wheel',e=>{e.preventDefault(); view.zoom=Math.max(0.2,Math.min(6,view.zoom*(e.deltaY<0?1.1:0.9))); redraw();},{passive:false});
 }
 
-// ---------- TAB ----------
 document.querySelectorAll('.tabs button').forEach(b=>b.addEventListener('click',()=>{
   const t=b.dataset.t;
   document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===t));
@@ -301,13 +339,12 @@ document.querySelectorAll('.tabs button').forEach(b=>b.addEventListener('click',
   if(t==='maps'){ loadMaps(); drawMapsTab(); }
 }));
 
-// ================= TRỰC TIẾP =================
 const liveCv=document.getElementById('liveCanvas'), liveCtx=liveCv.getContext('2d');
 let liveW=newWorld(), liveView={camX:0,camY:0,zoom:1,follow:true}, bgMap=null, autoOn=false, spdSynced=false;
 function liveDraw(){ if(liveView.follow){liveView.camX=liveW.carX;liveView.camY=liveW.carY;} drawWorld(liveCtx,liveCv,liveW,liveView,bgMap); }
 attachPanZoom(liveCv, liveView, liveDraw);
 
-let ws;
+let ws, prevAst=null;
 function wsUrl(){ const p=location.protocol==='https:'?'wss':'ws'; return `${p}://${location.host}/ws/dashboard`; }
 function setRobot(on){ const el=document.getElementById('robotPill'); el.className='pill '+(on?'on':'off'); el.innerText='Robot: '+(on?'online':'offline'); }
 function connect(){
@@ -318,13 +355,20 @@ function connect(){
     if(m.type!=='telemetry') return;
     const d=m.data; setRobot(true);
     applyFrame(liveW,d);
+    // KHÁM PHÁ THÔNG MINH: đúng lúc robot VỪA chuyển sang trạng thái "quét map" (ast=6, cạnh lên
+    // từ giá trị khác), tính hướng khám phá từ bản đồ hiện có và gửi xuống robot -- kịp trước khi
+    // robot quét xong (SCAN_MS~1.7s) và quyết định có canh hướng hay không.
+    if(document.getElementById('exploreChk').checked && d.ast===6 && prevAst!==6){
+      const rel=computeExploreRelDeg(liveW);
+      if(rel!==null) send({cmd:'goto', rel_deg: Math.round(rel*10)/10});
+    }
+    prevAst=d.ast;
     document.getElementById('tDist').innerText=(d.dist>0?d.dist.toFixed(0):'--')+' cm';
     const sf=document.getElementById('tSafe'); if(d.safe===0){sf.innerText='vật cản';sf.className='pill off';}else{sf.innerText='an toàn';sf.className='pill';}
     if(d.auto!==undefined && !!d.auto!==autoOn) setAutoUI(d.auto===1);
-    // chuyển động / hoạt động auto (text ngắn để không rớt dòng)
     let mvTxt = d.mv===1?'tiến':d.mv===-1?'lùi':'—';
     if(d.auto && d.ast!==undefined){
-      const A=['đi thẳng','ngó trái','ngó phải','quyết định','lùi','rẽ','quét map'];
+      const A=['đi thẳng','ngó trái','ngó phải','quyết định','lùi','rẽ','quét map','canh hướng'];
       mvTxt=A[d.ast]||'—';
     }
     document.getElementById('tMove').innerText=mvTxt;
@@ -342,6 +386,13 @@ document.querySelectorAll('#dpad .btn').forEach(b=>{ const d=b.dataset.d;
 });
 const spdEl=document.getElementById('spd'); spdEl.oninput=()=>{document.getElementById('spdVal').innerText=spdEl.value; send({cmd:'speed',val:parseInt(spdEl.value)});};
 document.getElementById('liveClear').onclick=()=>{ liveW=newWorld(); liveView.follow=true; liveDraw(); };
+document.getElementById('liveResetPos').onclick=()=>{
+  if(!confirm('Đặt robot về vị trí gốc (0,0), giữ nguyên map đã quét?')) return;
+  liveW.carX=0; liveW.carY=0; liveW.ang=-Math.PI/2;
+  liveW.traj.push({x:0,y:0});
+  liveW.prevScan=null;
+  liveView.follow=true; liveDraw();
+};
 document.getElementById('liveSaveMap').onclick=async()=>{
   const name=prompt('Tên map:', 'Map '+new Date().toLocaleString());
   if(!name) return;
@@ -350,7 +401,6 @@ document.getElementById('liveSaveMap').onclick=async()=>{
   alert('Đã lưu map "'+name+'" vào kho.');
 };
 
-// ================= XEM LẠI =================
 const rpCv=document.getElementById('replayCanvas'), rpCtx=rpCv.getContext('2d');
 let rpW=newWorld(), rpView={camX:0,camY:0,zoom:1,follow:true};
 let rpFrames=[], rpIdx=0, rpPlaying=false, rpSpeed=1, rpTimer=null, rpT0=0;
@@ -378,7 +428,7 @@ async function openSession(id){
   document.getElementById('rpSeek').value=0;
   rpStop(); rebuildTo(0); rpDraw();
 }
-function rebuildTo(idx){ // dựng lại map từ đầu tới khung idx
+function rebuildTo(idx){
   rpW=newWorld();
   for(let i=0;i<=idx && i<rpFrames.length;i++) applyFrame(rpW, rpFrames[i]);
   rpIdx=idx;
@@ -386,7 +436,7 @@ function rebuildTo(idx){ // dựng lại map từ đầu tới khung idx
   document.getElementById('rpTime').innerText=t.toFixed(1)+'s';
   document.getElementById('rpSeek').value=idx;
 }
-function rpStep(){ // phát theo thời gian thực _t
+function rpStep(){
   if(!rpPlaying||!rpFrames.length) return;
   const now=performance.now(); const elapsed=(now-rpT0)*rpSpeed;
   const baseT=rpFrames[rpIdx]?(rpFrames[rpIdx]._t||0):0;
@@ -401,7 +451,6 @@ document.getElementById('rpPlay').onclick=()=>{ rpPlaying?rpStop():rpPlay(); };
 document.getElementById('rpSeek').oninput=e=>{ rpStop(); rebuildTo(parseInt(e.target.value)); rpDraw(); };
 document.querySelectorAll('[data-spd]').forEach(b=>b.onclick=()=>{ rpSpeed=parseFloat(b.dataset.spd); rpT0=performance.now(); });
 
-// ================= KHO MAP =================
 const mpCv=document.getElementById('mapCanvas'), mpCtx=mpCv.getContext('2d');
 let mpW=newWorld(), mpView={camX:0,camY:0,zoom:1,follow:false};
 function drawMapsTab(){ drawWorld(mpCtx,mpCv,mpW,mpView,null); }
@@ -433,7 +482,6 @@ async function useAsBackground(id){
   liveDraw();
 }
 
-// ---------- khởi động ----------
 connect(); liveDraw();
 </script>
 </body>
