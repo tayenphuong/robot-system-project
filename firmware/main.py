@@ -100,21 +100,28 @@ try: i2c.writeto_mem(MPU_ADDR,0x6B,b'\x00')
 except Exception as e: print("MPU?",e)
 
 # ===================== Tham số =====================
-manualSpeed=140; autoSpeed=45; AUTO_MIN_SPEED=40; motorBalance=0   # BẢN ỔN ĐỊNH: giữ thuật toán AUTO cũ, chỉ giảm tốc vừa phải
-# LƯU Ý: PWM 20 / lùi 10 trên nhiều bộ motor sẽ KHÔNG ĐỦ LỰC để bánh quay.
-# Vì vậy bản này để AUTO=45 và lùi=30 cho xe chạy được trước; nếu motor khỏe thì hạ dần.
-BACK_SPEED=30
-KP_STRAIGHT=8; STRAIGHT_CORR_MAX=55
+manualSpeed=30; autoSpeed=30; AUTO_MIN_SPEED=30; motorBalance=0   # AUTO giữ tốc độ chạy 30 để quét map ổn định hơn
+# LƯU Ý: bản này khóa tốc độ chạy mặc định 30 và lùi 20 để robot quét map chậm, ít vọt hơn.
+# Nếu motor yếu không quay nổi ở PWM 20 khi lùi, tăng BACK_SPEED từng bước 20 -> 25 -> 30.
+BACK_SPEED=20
+KP_STRAIGHT=4; STRAIGHT_CORR_MAX=12
 STRAIGHT_RESET_MS=350
 SAFE_DISTANCE=20.0; SLOW_DISTANCE=60.0
 AUTO_STOP_DIST=30.0; AUTO_CLEAR_DIST=40.0; STUCK_DIST=12.0   # <=30cm mới coi là vật chắn phía trước
+USE_CLIFF_GUARD=False        # False: AUTO chỉ lùi theo sonar <=30cm, không lùi vì cảm biến cliff nhiễu/floating
+USE_FRONT_IR_STOP=True       # IR trước chỉ dừng/cho quét lại, không tự kích lùi
 # STRICT_FRONT_ONLY=True: AUTO chỉ lùi khi sonar đang nhìn đúng hướng trước và đo <=30cm.
 # Các số đo xa hơn 30cm được xem là ĐƯỜNG THOÁNG, không được giữ trong buffer để khỏi lỗi cứ lùi.
 STRICT_FRONT_ONLY=True
 SERVO_MIN,SERVO_MAX,SERVO_STEP=30,150,6
-SERVO_SETTLE=300; TURN_MIN=250; TURN_MAX=1600; BACKUP_SHORT=260; BACKUP_LONG=380  # lùi ngắn hơn, xấp xỉ vài cm tùy nền/pin
+SERVO_SETTLE=300; TURN_MIN=360; TURN_MAX=1500; BACKUP_SHORT=180; BACKUP_LONG=320  # lùi ít hơn, ưu tiên xoay tại chỗ
 DRIVE_MS=1300; SCAN_MS=1100
-BRAKE_MS=70
+GOTO_DRIVE_MS=850; ALIGN_TURN_MAX=2200
+BRAKE_MS=0
+PWM_RAMP_STEP=5; KICK_MS=100; KICK_LOGIC_SPEED=40
+FWD_PWM_MIN=60; BACK_PWM_MIN=58; TURN_PWM_MIN=64; MOTOR_PWM_CAP=95
+GYRO_STRAIGHT_DEADBAND_DPS=3.0; GYRO_STILL_DEADBAND_DPS=1.2
+IR_DEBOUNCE_COUNT=3
 # Vùng góc RẤT HẸP coi là "thẳng trước" để quyết định đi/dừng.
 # Thu hẹp từ 72-108 xuống 85-95 để khi servo quét lệch trái/phải không kích hoạt lùi nhầm.
 FRONT_NARROW_LO=85; FRONT_NARROW_HI=95
@@ -127,6 +134,7 @@ frontDistance=999.0; frontTrust=999.0; frontGuard=999.0
 cliffAhead=False; rearObstacle=False
 servoAngle=90; servoDir=1; motionDir=0
 autoMode=False; autoState=0; autoTimer=0; backupTime=0; distLeft=0.0; distRight=0.0; turnDir=1
+frontIrBlocked=False
 _next_auto_side=1   # 1=ưu tiên phải trước, -1=trái; sau mỗi lần gặp vật cản thì luân phiên
 _last_turn_dir=0; _same_turn_count=0     # theo dõi để phá vòng lặp khám phá (rẽ hoài 1 hướng)
 _drive_target_ms=1300                    # thời gian đi thẳng mỗi đoạn, random hóa mỗi lần để tránh đi đúng 1 quỹ đạo lặp lại
@@ -135,11 +143,14 @@ _align_accum_deg=0.0                     # tích lũy góc đã quay được tr
 forwardCmd=backCmd=leftCmd=rightCmd=False
 _dist_buf=[]; _front_samples=[]
 _dist_buf_angle=None      # góc servo mà lô mẫu _dist_buf hiện tại thuộc về (tránh trộn khoảng cách của các góc khác nhau)
+_front_measure_ms=0       # thời điểm có mẫu sonar thật sự ở vùng thẳng trước
 _heading_accum_deg=0.0    # góc quay dồn tích từ lần gửi telemetry trước, tính bằng tích phân LIÊN TỤC (không phụ thuộc chu kỳ gửi)
 _last_gyro_ms=0
 _bodyStationary=True      # thân robot có thực sự đứng yên hay không (khác motionDir=0: pivot-turn cũng =0 nhưng thân đang xoay)
 _straight_active=False; _baseL=0; _baseR=0; _straight_last_reset=0
-_prev_moving=False; _kick_until=0; KICK_MS=130   # "đá ga" 130ms khi khởi động chống kẹt
+_prev_moving=False; _kick_until=0
+_pwmL=0; _pwmR=0; _driveMode="stop"
+_ir_front_cnt=0; _ir_rear_cnt=0
 
 def _isr_L(p):
     global ticksL; ticksL+=1
@@ -153,6 +164,33 @@ def _duty(v):
     if v<0:v=0
     if v>255:v=255
     return v*257
+def _ramp_to(cur,target):
+    if target<0: target=0
+    if target>255: target=255
+    if target>cur+PWM_RAMP_STEP: return cur+PWM_RAMP_STEP
+    if target<cur-PWM_RAMP_STEP: return cur-PWM_RAMP_STEP
+    return target
+def _logic_to_pwm(v,mode):
+    # Web/logic speed 30-40 is intentionally slow. DC motors usually need
+    # a higher real PWM floor to overcome static friction, so map it here.
+    if v<=0: return 0
+    if mode=="back":
+        pwm=BACK_PWM_MIN+(v-BACK_SPEED)*1.6
+    elif mode=="left" or mode=="right":
+        pwm=TURN_PWM_MIN+(v-30)*2.0
+    else:
+        pwm=FWD_PWM_MIN+(v-30)*2.0
+        if v<30: pwm=FWD_PWM_MIN-(30-v)*0.8
+    if pwm<0: pwm=0
+    if pwm>MOTOR_PWM_CAP: pwm=MOTOR_PWM_CAP
+    return int(pwm)
+def _set_pwm_pair(ls,rs,mode):
+    global _pwmL,_pwmR,_driveMode
+    if _driveMode!=mode:
+        _pwmL=0; _pwmR=0; _driveMode=mode
+    _pwmL=_ramp_to(_pwmL,_logic_to_pwm(ls,mode))
+    _pwmR=_ramp_to(_pwmR,_logic_to_pwm(rs,mode))
+    ena.duty_u16(_duty(_pwmL)); enb.duty_u16(_duty(_pwmR))
 def _kick_check(moving):
     # Khi vừa chuyển từ đứng yên -> chuyển động, đá ga đầy trong KICK_MS để thắng
     # ma sát tĩnh (chống stall/kêu ù mà không quay). Trả True khi đang trong cửa sổ kick.
@@ -163,17 +201,18 @@ def _kick_check(moving):
     _prev_moving=moving
     return time.ticks_diff(_kick_until,now)>0
 def driveStop():
-    global motionDir,_bodyStationary; motionDir=0; _bodyStationary=True
+    global motionDir,_bodyStationary,_pwmL,_pwmR,_driveMode; motionDir=0; _bodyStationary=True
     _kick_check(False)
+    _pwmL=0; _pwmR=0; _driveMode="stop"
     IN1.value(0);IN2.value(0);IN3.value(0);IN4.value(0); ena.duty_u16(0); enb.duty_u16(0)
 def driveBrake(ms):
     # Phanh chủ động: nếu đang tiến, đảo chiều ngắn (BRAKE_MS) để triệt bớt quán tính trước khi
     # cắt hẳn điện. Chỉ cắt điện đơn thuần (driveStop) khiến robot trôi thêm 1 đoạn theo trớn,
     # dễ vượt qua ngưỡng an toàn AUTO_STOP_DIST và đâm vào vật -> đây là phanh CÓ chủ đích.
     global motionDir
-    if motionDir==1:
+    if ms>0 and motionDir==1:
         IN1.value(0);IN2.value(1);IN3.value(0);IN4.value(1)
-        ena.duty_u16(_duty(190)); enb.duty_u16(_duty(190))
+        ena.duty_u16(_duty(60)); enb.duty_u16(_duty(60))
         time.sleep_ms(ms)
     driveStop()
 def _straight_reset():
@@ -195,23 +234,25 @@ def driveForwardStraight(speed):
     ls=speed-corr; rs=speed+corr
     if motorBalance>0: ls-=motorBalance
     elif motorBalance<0: rs+=motorBalance
-    if kick: ls=rs=255
-    IN1.value(1);IN2.value(0);IN3.value(1);IN4.value(0); ena.duty_u16(_duty(ls)); enb.duty_u16(_duty(rs))
+    if kick:
+        if ls<KICK_LOGIC_SPEED: ls=KICK_LOGIC_SPEED
+        if rs<KICK_LOGIC_SPEED: rs=KICK_LOGIC_SPEED
+    IN1.value(1);IN2.value(0);IN3.value(1);IN4.value(0); _set_pwm_pair(ls,rs,"fwd")
 def driveBackward(s):
     global motionDir,_bodyStationary; motionDir=-1; _bodyStationary=False
-    if _kick_check(True): s=255
+    if _kick_check(True) and s<KICK_LOGIC_SPEED: s=KICK_LOGIC_SPEED
     ls=rs=s
     if motorBalance>0:ls=s-motorBalance
     elif motorBalance<0:rs=s+motorBalance
-    IN1.value(0);IN2.value(1);IN3.value(0);IN4.value(1); ena.duty_u16(_duty(ls)); enb.duty_u16(_duty(rs))
+    IN1.value(0);IN2.value(1);IN3.value(0);IN4.value(1); _set_pwm_pair(ls,rs,"back")
 def driveLeft(s):
     global motionDir,_bodyStationary; motionDir=0; _bodyStationary=False   # PIVOT xoay -> thân KHÔNG đứng yên, dù motionDir=0
-    if _kick_check(True): s=255
-    IN1.value(0);IN2.value(1);IN3.value(1);IN4.value(0); ena.duty_u16(_duty(s)); enb.duty_u16(_duty(s))
+    if _kick_check(True) and s<KICK_LOGIC_SPEED: s=KICK_LOGIC_SPEED
+    IN1.value(0);IN2.value(1);IN3.value(1);IN4.value(0); _set_pwm_pair(s,s,"left")
 def driveRight(s):
     global motionDir,_bodyStationary; motionDir=0; _bodyStationary=False
-    if _kick_check(True): s=255
-    IN1.value(1);IN2.value(0);IN3.value(0);IN4.value(1); ena.duty_u16(_duty(s)); enb.duty_u16(_duty(s))
+    if _kick_check(True) and s<KICK_LOGIC_SPEED: s=KICK_LOGIC_SPEED
+    IN1.value(1);IN2.value(0);IN3.value(0);IN4.value(1); _set_pwm_pair(s,s,"right")
 def setServoAngle(a):
     if a<0:a=0
     if a>180:a=180
@@ -247,22 +288,55 @@ def canMoveForward():
 def isServoFront():
     return FRONT_NARROW_LO<=servoAngle<=FRONT_NARROW_HI
 
+def isDistBufFront():
+    return _dist_buf_angle is not None and FRONT_NARROW_LO<=_dist_buf_angle<=FRONT_NARROW_HI
+
+def frontMeasureFresh(max_age_ms=220):
+    return isDistBufFront() and time.ticks_diff(time.ticks_ms(),_front_measure_ms)<max_age_ms
+
 def clearFrontGuard():
     # Xóa mẫu sonar thẳng cũ. Khi robot vừa lùi/rẽ/quét xong, mẫu <=30cm cũ
     # có thể còn nằm trong buffer 600ms làm AUTO tưởng trước mặt vẫn bị chắn,
     # nên nó cứ lùi -> quét -> lùi. Clear để AUTO phải đo lại ở góc 90° rồi mới quyết định.
-    global _front_samples, frontTrust, frontGuard
+    global _front_samples, frontTrust, frontGuard, frontDistance
+    global _dist_buf, _dist_buf_angle, _front_measure_ms
     _front_samples=[]
     frontTrust=999.0
     frontGuard=999.0
+    frontDistance=999.0
+    _dist_buf=[]
+    _dist_buf_angle=None
+    _front_measure_ms=0
 
 def frontBlocked30():
     # AUTO chỉ coi là vật chắn khi sonar đang nhìn ĐÚNG THẲNG trước và đo <=30cm.
     # Không dùng số đo xa hơn 30cm để quyết định lùi; xa hơn 30cm = còn thoáng, cứ tiến.
-    return isServoFront() and (0<frontDistance<=AUTO_STOP_DIST)
+    return frontMeasureFresh() and len(_front_samples)>=2 and (0<frontTrust<=AUTO_STOP_DIST)
+
+def normDist(d):
+    # Sonar timeout/999 nghĩa là không thấy vật trong tầm gần -> coi là rất thoáng.
+    if d<=0 or d>300: return 300.0
+    return d
+
+def sideClear(d):
+    return normDist(d)>=AUTO_CLEAR_DIST
+
+def updateIrSensors():
+    global cliffAhead,rearObstacle,frontIrBlocked,_ir_front_cnt,_ir_rear_cnt
+    if ir_cliff.value()==1:
+        _ir_front_cnt+=1
+    else:
+        _ir_front_cnt=0
+    if ir_rear.value()==0:
+        _ir_rear_cnt+=1
+    else:
+        _ir_rear_cnt=0
+    frontIrBlocked=_ir_front_cnt>=IR_DEBOUNCE_COUNT
+    cliffAhead=frontIrBlocked
+    rearObstacle=_ir_rear_cnt>=IR_DEBOUNCE_COUNT
 
 def handle_command(text):
-    global autoMode,autoState,autoTimer,servoAngle,motorBalance,manualSpeed,_next_auto_side
+    global autoMode,autoState,autoTimer,servoAngle,motorBalance,manualSpeed,_next_auto_side,_drive_target_ms
     global forwardCmd,backCmd,leftCmd,rightCmd
     try: d=json.loads(text)
     except Exception: return
@@ -276,7 +350,7 @@ def handle_command(text):
         else:
             driveStop()
     elif c=="speed":
-        try: manualSpeed=max(60,min(255,int(d.get("val",manualSpeed))))
+        try: manualSpeed=max(30,min(40,int(d.get("val",manualSpeed))))
         except Exception: pass
     elif c=="trim":
         try: motorBalance=max(-120,min(120,int(d.get("val",0))))
@@ -287,8 +361,12 @@ def handle_command(text):
         # Chỉ lưu lại, robot sẽ tự quyết định lúc nào dùng nó (an toàn vẫn ưu tiên trên hết).
         global _goto_rel_deg,_goto_ts
         try:
-            _goto_rel_deg=float(d.get("rel_deg"))
+            rel=float(d.get("rel_deg"))
+            if rel>150: rel=150
+            if rel<-150: rel=-150
+            _goto_rel_deg=rel
             _goto_ts=time.ticks_ms()
+            _drive_target_ms=GOTO_DRIVE_MS+(os.urandom(1)[0]%250)
         except Exception: pass
     elif c=="f":
         autoMode=False  # bấm lái tay là thoát AUTO thật sự, không chỉ tắt giao diện
@@ -317,7 +395,10 @@ def runAuto():
     if autoState==0:    # DRIVE: đi thẳng đoạn ngắn, servo nhìn thẳng canh trước
         if servoAngle!=90:
             servoAngle=90; setServoAngle(90)
-        if cliffAhead or frontBlocked30():
+        if USE_FRONT_IR_STOP and frontIrBlocked:
+            driveStop(); _straight_active=False
+            clearFrontGuard(); autoTimer=now; autoState=6
+        elif (USE_CLIFF_GUARD and cliffAhead) or frontBlocked30():
             driveBrake(BRAKE_MS); _straight_active=False
             servoAngle=SERVO_MAX; setServoAngle(servoAngle); autoTimer=now; autoState=1
         elif time.ticks_diff(now,autoTimer)>=_drive_target_ms:   # đi đủ 1 đoạn -> dừng quét bồi map
@@ -340,21 +421,28 @@ def runAuto():
             # BẢN ỔN ĐỊNH: vẫn dùng FSM AUTO cũ, nhưng ưu tiên zigzag luân phiên:
             # vật cản đầu tiên né PHẢI, vật cản kế tiếp né TRÁI, rồi lặp lại.
             # Nếu bên ưu tiên bị bí mà bên còn lại thoáng thì tự đổi bên để khỏi đâm tường.
-            preferred=_next_auto_side
-            newDir=preferred
-            if preferred>0 and distRight<AUTO_CLEAR_DIST and distLeft>=AUTO_CLEAR_DIST:
-                newDir=-1
-            elif preferred<0 and distLeft<AUTO_CLEAR_DIST and distRight>=AUTO_CLEAR_DIST:
-                newDir=1
-            elif max(distLeft,distRight)<AUTO_CLEAR_DIST:
-                newDir = -1 if distLeft>=distRight else 1
-                backupTime=BACKUP_LONG
+            lOpen=sideClear(distLeft); rOpen=sideClear(distRight)
+            if lOpen and rOpen:
+                # Cả hai bên đều thoáng: đi theo bên rộng hơn, nếu ngang nhau thì luân phiên.
+                if abs(normDist(distLeft)-normDist(distRight))<8:
+                    turnDir=_next_auto_side
+                else:
+                    turnDir=-1 if normDist(distLeft)>normDist(distRight) else 1
+                backupTime=0; autoState=5
+            elif lOpen:
+                turnDir=-1; backupTime=0; autoState=5
+            elif rOpen:
+                turnDir=1; backupTime=0; autoState=5
             else:
-                backupTime=BACKUP_SHORT
-            turnDir=newDir; _last_turn_dir=newDir
+                # Trước, trái, phải đều bí. Nếu sau cũng bí thì đứng chờ/quét lại; nếu sau trống thì lùi ngắn rồi xoay về bên ít bí hơn.
+                turnDir=-1 if normDist(distLeft)>=normDist(distRight) else 1
+                if rearObstacle:
+                    autoState=8
+                else:
+                    backupTime=BACKUP_LONG
+                    autoState=4
+            _last_turn_dir=turnDir
             _next_auto_side=-_next_auto_side
-            # Luôn lùi một đoạn ngắn rồi mới rẽ để tạo đường né kiểu zigzag/vuông hơn.
-            autoState=4
             autoTimer=now
     elif autoState==4:
         if rearObstacle: driveStop(); autoState=5; autoTimer=now
@@ -370,21 +458,30 @@ def runAuto():
             servoAngle=90; setServoAngle(90); servoDir=1
             _drive_target_ms=DRIVE_MS+(os.urandom(1)[0]%700)   # random hóa đoạn đi kế tiếp (~1.3-2.0s)
             clearFrontGuard(); autoState=0; autoTimer=now; _straight_active=False
+    elif autoState==8:    # TRAPPED: trước/trái/phải/sau đều bí hoặc IR báo nguy hiểm -> đứng yên, quét lại
+        driveStop(); _straight_active=False
+        if time.ticks_diff(now,autoTimer)>=900:
+            clearFrontGuard(); servoAngle=90; setServoAngle(90); servoDir=1
+            autoState=6; autoTimer=now
     elif autoState==6:    # SCAN_MAP: đứng yên quét rộng (servo do main loop quét) để bồi map
         driveStop(); _straight_active=False
         if time.ticks_diff(now,autoTimer)>=SCAN_MS:
             servoAngle=90; setServoAngle(90); servoDir=1
-            _drive_target_ms=DRIVE_MS+(os.urandom(1)[0]%700)   # random hóa đoạn đi kế tiếp
             # Có gợi ý hướng khám phá từ web còn hiệu lực (chưa quá hạn) và đáng để quay (>15°)
             # -> xoay canh theo hướng đó trước khi đi thẳng, thay vì cứ đi thẳng theo hướng cũ.
             has_goto = _goto_rel_deg is not None and time.ticks_diff(now,_goto_ts) < _GOTO_VALID_MS
             if has_goto and abs(_goto_rel_deg) > 15:
+                _drive_target_ms=GOTO_DRIVE_MS+(os.urandom(1)[0]%250)   # đi ngắn, quét lại thường xuyên để bám waypoint
                 _align_accum_deg=0.0; turnDir=-1 if _goto_rel_deg<0 else 1
                 autoState=7; autoTimer=now
             else:
+                _drive_target_ms=DRIVE_MS+(os.urandom(1)[0]%700)   # không có waypoint thì đi khám phá tự do dài hơn
                 clearFrontGuard(); autoState=0; autoTimer=now
     elif autoState==7:    # ALIGN: xoay canh theo hướng khám phá gợi ý từ web trước khi đi thẳng
-        if cliffAhead or frontBlocked30():
+        if USE_FRONT_IR_STOP and frontIrBlocked:
+            driveStop(); _straight_active=False
+            clearFrontGuard(); autoState=8; autoTimer=now
+        elif (USE_CLIFF_GUARD and cliffAhead) or frontBlocked30():
             # An toàn trên hết: giữa chừng canh hướng mà phát hiện nguy hiểm -> bỏ canh hướng,
             # xử lý như gặp vật cản bình thường (ngó trái/phải rồi tự quyết định).
             driveBrake(BRAKE_MS); _straight_active=False
@@ -393,7 +490,7 @@ def runAuto():
             driveLeft(autoSpeed) if turnDir<0 else driveRight(autoSpeed)
             el=time.ticks_diff(now,autoTimer)
             done = abs(_align_accum_deg) >= abs(_goto_rel_deg) if _goto_rel_deg is not None else True
-            if done or el>=TURN_MAX:
+            if done or el>=ALIGN_TURN_MAX:
                 driveStop(); _goto_rel_deg=None   # dùng xong, xóa để không lặp lại gợi ý cũ
                 servoAngle=90; setServoAngle(90); servoDir=1
                 clearFrontGuard(); autoState=0; autoTimer=now; _straight_active=False
@@ -437,8 +534,9 @@ def wifi_connect():
 # ===================== MAIN LOOP =====================
 def main():
     global frontDistance,frontTrust,frontGuard,cliffAhead,rearObstacle
+    global frontIrBlocked,_ir_front_cnt,_ir_rear_cnt
     global servoAngle,servoDir,lastTicksL,lastTicksR,_straight_active,_dist_buf,_front_samples
-    global _dist_buf_angle,_heading_accum_deg,_last_gyro_ms,GYRO_OFFSET
+    global _dist_buf_angle,_front_measure_ms,_heading_accum_deg,_last_gyro_ms,GYRO_OFFSET
     global _last_ticksL_loop,_last_ticksR_loop,_signed_dist_accum
     global _align_accum_deg,_goto_rel_deg,_goto_ts
     calibrateGyro()
@@ -459,6 +557,10 @@ def main():
         if 0<dt_gyro_ms<200:   # bỏ qua nếu dt bất thường (vừa mất kết nối, lệnh block lâu, v.v.)
             raw_gz=readGyroZRaw()
             rate_dps=(raw_gz-GYRO_OFFSET)/131.0
+            if motionDir!=0 and abs(rate_dps)<GYRO_STRAIGHT_DEADBAND_DPS:
+                rate_dps=0.0
+            if _bodyStationary and abs(rate_dps)<GYRO_STILL_DEADBAND_DPS:
+                rate_dps=0.0
             _heading_accum_deg+=rate_dps*(dt_gyro_ms/1000.0)
             _align_accum_deg+=rate_dps*(dt_gyro_ms/1000.0)   # tích lũy riêng cho state ALIGN, reset lúc bắt đầu xoay canh hướng
             if _bodyStationary:
@@ -502,27 +604,29 @@ def main():
             if d>0:
                 _dist_buf.append(d)
                 if len(_dist_buf)>5: _dist_buf.pop(0)
+            elif isServoFront():
+                _dist_buf=[]
             frontDistance=sorted(_dist_buf)[len(_dist_buf)//2] if _dist_buf else 999.0
+            if isDistBufFront() and d>0:
+                _front_measure_ms=now
             # Chỉ ghi nhận vật chắn khi sonar đang nhìn gần đúng 90° VÀ khoảng cách <=30cm.
             # Nếu đo 31cm, 60cm, 100cm... thì coi là chưa tới vật chắn -> không lùi.
-            if isServoFront() and 0<frontDistance<=AUTO_STOP_DIST:
-                _front_samples.append((now,frontDistance))
-            _front_samples=[(t,v) for (t,v) in _front_samples if time.ticks_diff(now,t)<250]
+            if isDistBufFront():
+                if frontMeasureFresh() and 0<frontDistance<=AUTO_STOP_DIST:
+                    _front_samples.append((now,frontDistance))
+                else:
+                    _front_samples=[]
+            _front_samples=[(t,v) for (t,v) in _front_samples if time.ticks_diff(now,t)<320]
             frontTrust=min(v for (t,v) in _front_samples) if _front_samples else 999.0
             frontGuard=frontTrust
-            cliffAhead=(ir_cliff.value()==1)
-            rearObstacle=(ir_rear.value()==0)
+            updateIrSensors()
             last_sonar=now
         # điều khiển
         if autoMode:
             runAuto()
         else:
             spd=manualSpeed
-            # lái tay: chỉ giảm tốc khi tới GẦN (40cm), và giữ SÀN đủ khỏe để bánh không kẹt
-            if SAFE_DISTANCE<frontGuard<40.0:
-                spd=manualSpeed//2
-                if spd<80: spd=80
-                if spd>manualSpeed: spd=manualSpeed
+            # Lái tay giữ đúng slider 30-40, không tự nhảy tốc làm xe giật.
             # Lái tay phải chạy được cả TIẾN và LÙI. Không chặn tiến bằng sonar nữa,
             # vì sonar/servo đang quét có thể đọc nhầm vật cản làm nút ▲ không chạy.
             # Khi cần dừng khẩn thì bấm nút ■.
@@ -544,11 +648,12 @@ def main():
             ang_for_dist=_dist_buf_angle if _dist_buf_angle is not None else servoAngle
             dnL=ticksL-lastTicksL; lastTicksL=ticksL
             dnR=ticksR-lastTicksR; lastTicksR=ticksR
-            if autoMode: safe=0 if (cliffAhead or frontBlocked30()) else 1
+            if autoMode: safe=0 if ((USE_CLIFF_GUARD and cliffAhead) or frontBlocked30()) else 1
             else: safe=1 if canMoveForward() else 0
             pkt={"ticks":ticksL+ticksR,"dL":round(dL,2),"dnL":dnL,"dnR":dnR,"dz":round(dz,3),
                  "dist":round(frontDistance,1),"ang":ang_for_dist,"mv":motionDir,
-                 "ast":autoState,"spd":manualSpeed,"aspd":autoSpeed,"bs":BACK_SPEED,"safe":safe,"rear":1 if rearObstacle else 0,
+                 "ast":autoState,"spd":manualSpeed,"aspd":autoSpeed,"bs":BACK_SPEED,"safe":safe,
+                 "irf":1 if frontIrBlocked else 0,"rear":1 if rearObstacle else 0,
                  "auto":1 if autoMode else 0}
             try: ws.send(json.dumps(pkt))
             except Exception: ws.connected=False

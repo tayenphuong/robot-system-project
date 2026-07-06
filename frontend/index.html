@@ -77,8 +77,8 @@
       </div>
     </div>
     <div class="card">
-      <div class="slabel"><span>Tốc độ</span><b id="spdVal">140</b></div>
-      <input type="range" min="60" max="200" value="140" id="spd">
+      <div class="slabel"><span>Tốc độ</span><b id="spdVal">30</b></div>
+      <input type="range" min="30" max="40" value="30" id="spd">
       <label style="display:flex; align-items:center; gap:8px; margin-top:10px; font-size:13px; color:var(--mut);">
         <input type="checkbox" id="exploreChk" style="width:16px; height:16px;">
         🧭 Khám phá thông minh (web gợi ý hướng dựa vào bản đồ, chỉ hoạt động khi AUTO bật)
@@ -122,11 +122,21 @@ const OBSTACLE_DETECT_CM = 30;   // <=30cm mới xác định là vật chắn
 const SENSOR_DRAW_MAX_CM = 160;
 const FREE_RAY_CM = 30;          // xa hơn 30cm thì chỉ vẽ vùng trống phía trước
 const OBSTACLE_LINE_CM = 12;      // chiều dài vết gạch vật cản: nhỏ, giống line đường đi
-const HEADING_GAIN = 2.0;          // thực tế quay 180° nhưng web chỉ hiện ~90° -> nhân đôi góc gyro nhận từ ESP32
+const HEADING_GAIN = 1.0;          // dùng đúng góc firmware gửi; không nhân đôi để tránh map bị lệch quá mức
+const ODOM_CM_PER_TICK = 0.35;     // giảm từ 0.5 để bớt phóng đại quãng đường encoder trên map
+const ODOM_TICK_DEADBAND = 1.2;    // bỏ qua tick rất nhỏ do rung/giật nhẹ
+const ROBOT_RADIUS_CM = 12;
+const FRONTIER_MAX_CM = 360;
+const FRONTIER_STEP_CELLS = 10;
+const INFLATE_CELLS = Math.max(1, Math.ceil((ROBOT_RADIUS_CM*PX_PER_CM)/CELL));
+const MANHATTAN_MIN_LINES = 12;
+const MANHATTAN_MIN_OCC_CELLS = 24;
+const MANHATTAN_MAX_STEP = Math.PI/180*1.2;
 
-function newWorld(){ return { grid:new Map(), carX:0, carY:0, ang:-Math.PI/2, traj:[{x:0,y:0}], beam:null, prevScan:null, obstacleLines:[] }; }
+function newWorld(){ return { grid:new Map(), carX:0, carY:0, ang:-Math.PI/2, traj:[{x:0,y:0}], beam:null, prevScan:null, obstacleLines:[], plan:[], frameSeq:0, lastSnapFrame:0, manhattanTotal:0, wallSkew:0, wallConfidence:0 }; }
 function updateCell(W, cx, cy, d){ let k=cx+','+cy; let v=(W.grid.get(k)||0)+d; W.grid.set(k, Math.max(L_MIN,Math.min(L_MAX,v))); }
 const OCC_SOLID=1.5;
+const OCC_BLOCK=0.65;
 function castRay(W, x0,y0,x1,y1,hit){
   let cx0=Math.floor(x0/CELL),cy0=Math.floor(y0/CELL),cx1=Math.floor(x1/CELL),cy1=Math.floor(y1/CELL);
   let dx=Math.abs(cx1-cx0),dy=Math.abs(cy1-cy0),sx=cx0<cx1?1:-1,sy=cy0<cy1?1:-1,err=dx-dy,cx=cx0,cy=cy0,g=0;
@@ -186,6 +196,103 @@ function paintObstacleBar(W, robotX, robotY, beamAng, distCm){
     const py=cy + f*OBSTACLE_LINE_CM*PX_PER_CM*ny;
     updateCell(W, Math.floor(px/CELL), Math.floor(py/CELL), L_OCC*1.1);
   }
+}
+
+function normRad(a){ while(a>Math.PI)a-=Math.PI*2; while(a<-Math.PI)a+=Math.PI*2; return a; }
+function rotXY(x, y, c, s){ return {x:x*c-y*s, y:x*s+y*c}; }
+function rotateObj(o, c, s){
+  const p=rotXY(o.x,o.y,c,s);
+  o.x=p.x; o.y=p.y;
+}
+function rotateWorld(W, da){
+  if(!isFinite(da) || Math.abs(da)<0.0005) return;
+  const c=Math.cos(da), s=Math.sin(da);
+  const car=rotXY(W.carX,W.carY,c,s);
+  W.carX=car.x; W.carY=car.y; W.ang=normRad(W.ang+da);
+  W.traj.forEach(p=>rotateObj(p,c,s));
+  W.plan.forEach(p=>rotateObj(p,c,s));
+  if(W.beam){ rotateObj(W.beam,c,s); W.beam.ang=normRad(W.beam.ang+da); }
+  if(W.prevScan){ rotateObj(W.prevScan,c,s); W.prevScan.ang=normRad(W.prevScan.ang+da); }
+  for(const o of W.obstacleLines){
+    const p1=rotXY(o.x1,o.y1,c,s), p2=rotXY(o.x2,o.y2,c,s);
+    o.x1=p1.x; o.y1=p1.y; o.x2=p2.x; o.y2=p2.y;
+  }
+  const ng=new Map();
+  W.grid.forEach((l,k)=>{
+    const i=k.indexOf(','), cx=+k.slice(0,i), cy=+k.slice(i+1);
+    const p=rotXY((cx+0.5)*CELL,(cy+0.5)*CELL,c,s);
+    const nk=Math.floor(p.x/CELL)+','+Math.floor(p.y/CELL);
+    const old=ng.get(nk);
+    if(old===undefined) ng.set(nk,l);
+    else if(l>=OCC_BLOCK || old>=OCC_BLOCK) ng.set(nk,Math.max(old,l));
+    else ng.set(nk,Math.max(L_MIN,Math.min(L_MAX,(old+l)*0.5)));
+  });
+  W.grid=ng;
+  W.manhattanTotal=normRad((W.manhattanTotal||0)+da);
+}
+function estimateWallSkew(W){
+  const lines=W.obstacleLines||[];
+  let sx=0, cx=0, wsum=0;
+  const addAxis=(a,w)=>{
+    sx+=Math.sin(4*a)*w;
+    cx+=Math.cos(4*a)*w;
+    wsum+=w;
+  };
+  const hitPts=[];
+  if(lines.length>=MANHATTAN_MIN_LINES){
+    const start=Math.max(0, lines.length-360);
+    for(let i=start;i<lines.length;i++){
+      const o=lines[i], dx=o.x2-o.x1, dy=o.y2-o.y1, len=Math.hypot(dx,dy);
+      if(len<6) continue;
+      hitPts.push({x:(o.x1+o.x2)/2,y:(o.y1+o.y2)/2});
+      addAxis(Math.atan2(dy,dx), Math.min(10,len)*0.35);
+    }
+  }
+  if(hitPts.length>=25){
+    const stride=Math.max(1,Math.ceil(hitPts.length/180));
+    for(let i=0;i<hitPts.length;i+=stride){
+      for(let j=i+stride;j<hitPts.length;j+=stride){
+        const dx=hitPts[j].x-hitPts[i].x, dy=hitPts[j].y-hitPts[i].y;
+        const r2=dx*dx+dy*dy;
+        if(r2<25 || r2>90000) continue;
+        addAxis(Math.atan2(dy,dx), Math.min(80,Math.sqrt(r2)));
+      }
+    }
+  }
+  const occ=[], occSet=new Set();
+  W.grid.forEach((l,k)=>{
+    if(l<OCC_BLOCK) return;
+    const i=k.indexOf(','), p={x:+k.slice(0,i), y:+k.slice(i+1), k};
+    occ.push(p); occSet.add(k);
+  });
+  if(occ.length>=MANHATTAN_MIN_OCC_CELLS){
+    const stride=Math.max(1,Math.ceil(occ.length/650));
+    for(let i=0;i<occ.length;i+=stride){
+      const p=occ[i];
+      for(let oy=-8;oy<=8;oy++) for(let ox=-8;ox<=8;ox++){
+        if(oy<0 || (oy===0 && ox<=0)) continue;
+        const r2=ox*ox+oy*oy;
+        if(r2<9 || r2>64) continue;
+        if(!occSet.has((p.x+ox)+','+(p.y+oy))) continue;
+        addAxis(Math.atan2(oy,ox), Math.sqrt(r2)*0.45);
+      }
+    }
+  }
+  if(wsum<120) return null;
+  const confidence=Math.hypot(sx,cx)/wsum;
+  if(confidence<0.58) return null;
+  return {err:0.25*Math.atan2(sx,cx), confidence};
+}
+function applyManhattanCorrection(W){
+  W.frameSeq=(W.frameSeq||0)+1;
+  if(W.frameSeq-(W.lastSnapFrame||0)<10) return;
+  const est=estimateWallSkew(W);
+  if(!est) return;
+  W.wallSkew=est.err; W.wallConfidence=est.confidence;
+  if(Math.abs(est.err)<Math.PI/180*0.7) return;
+  const step=Math.max(-MANHATTAN_MAX_STEP, Math.min(MANHATTAN_MAX_STEP, -est.err*0.25*est.confidence));
+  rotateWorld(W, step);
+  W.lastSnapFrame=W.frameSeq;
 }
 
 // Co (erode) rồi giãn (dilate) lại đúng bằng nhau -> loại các gai/tua MỎNG do nhiễu đo dao động
@@ -277,34 +384,78 @@ function drawFreeSmooth(ctx, W, sx, sy, z, alpha){
 // chưa biết) -- đây chính là hướng đáng đi tới để mở rộng bản đồ. Chọn frontier GẦN NHẤT.
 function normDeg(d){ while(d>180)d-=360; while(d<-180)d+=360; return d; }
 function computeExploreRelDeg(W){
-  const stepCm=6, maxCm=320, nDirs=24;
-  let best=null;
-  for(let i=0;i<nDirs;i++){
-    const ang=(i/nDirs)*2*Math.PI;
-    let d=0, hitFrontier=false;
-    while(d<maxCm){
-      d+=stepCm;
-      const wx=W.carX+d*PX_PER_CM*Math.cos(ang), wy=W.carY+d*PX_PER_CM*Math.sin(ang);
-      const cx=Math.floor(wx/CELL), cy=Math.floor(wy/CELL);
-      const l=W.grid.get(cx+','+cy);
-      if(l===undefined){ hitFrontier=true; break; }   // chưa biết -> đây là 1 frontier
-      if(l>=0) break;                                  // gặp vật cản -> hướng này bí, bỏ qua
+  const maxCells=Math.ceil((FRONTIER_MAX_CM*PX_PER_CM)/CELL);
+  const sx0=Math.floor(W.carX/CELL), sy0=Math.floor(W.carY/CELL);
+  const key=(x,y)=>x+','+y, start=key(sx0,sy0);
+  const blocked=new Set();
+  W.grid.forEach((l,k)=>{
+    if(l<OCC_BLOCK) return;
+    const i=k.indexOf(','), cx=+k.slice(0,i), cy=+k.slice(i+1);
+    for(let oy=-INFLATE_CELLS;oy<=INFLATE_CELLS;oy++) for(let ox=-INFLATE_CELLS;ox<=INFLATE_CELLS;ox++){
+      if(ox*ox+oy*oy<=INFLATE_CELLS*INFLATE_CELLS) blocked.add(key(cx+ox,cy+oy));
     }
-    if(hitFrontier && (!best || d<best.dist)) best={ang,dist:d};
+  });
+  const isKnownFree=(x,y)=>{
+    const l=W.grid.get(key(x,y));
+    return l!==undefined && l<OCC_BLOCK && !blocked.has(key(x,y));
+  };
+  if(!isKnownFree(sx0,sy0)) blocked.delete(start);
+  const hasUnknownNeighbor=(x,y)=>{
+    let unknown=0;
+    for(let oy=-1;oy<=1;oy++) for(let ox=-1;ox<=1;ox++){
+      if(ox===0&&oy===0) continue;
+      const k=key(x+ox,y+oy);
+      if(!blocked.has(k) && W.grid.get(k)===undefined) unknown++;
+    }
+    return unknown>=3;
+  };
+  const dirs=[[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+  const q=[{x:sx0,y:sy0,d:0}], seen=new Set([start]), parent=new Map();
+  let best=null;
+  for(let qi=0;qi<q.length;qi++){
+    const n=q[qi];
+    if(n.d>maxCells) break;
+    if(n.d>INFLATE_CELLS+2 && hasUnknownNeighbor(n.x,n.y)){
+      const dx=(n.x+0.5)*CELL-W.carX, dy=(n.y+0.5)*CELL-W.carY;
+      const rel=Math.abs(normDeg(Math.atan2(dy,dx)*180/Math.PI-W.ang*180/Math.PI));
+      const score=n.d+rel*0.04;
+      if(!best || score<best.score) best={...n,score};
+    }
+    for(const [ox,oy] of dirs){
+      const nx=n.x+ox, ny=n.y+oy, nk=key(nx,ny);
+      if(seen.has(nk) || !isKnownFree(nx,ny)) continue;
+      if(ox&&oy && (!isKnownFree(n.x+ox,n.y) || !isKnownFree(n.x,n.y+oy))) continue;
+      seen.add(nk); parent.set(nk,key(n.x,n.y)); q.push({x:nx,y:ny,d:n.d+1});
+    }
   }
-  if(!best) return null;   // đã khám phá hết trong tầm nhìn -> không có gợi ý
-  const targetDeg=best.ang*180/Math.PI, curDeg=W.ang*180/Math.PI;
-  return normDeg(targetDeg-curDeg);
+  if(!best){ W.plan=[]; return null; }
+  const path=[];
+  let cur=key(best.x,best.y);
+  while(cur && cur!==start){
+    const i=cur.indexOf(','), cx=+cur.slice(0,i), cy=+cur.slice(i+1);
+    path.push({x:(cx+0.5)*CELL,y:(cy+0.5)*CELL});
+    cur=parent.get(cur);
+  }
+  path.reverse();
+  W.plan=path;
+  const wp=path[Math.min(FRONTIER_STEP_CELLS,path.length-1)]||path[path.length-1];
+  if(!wp) return null;
+  const targetDeg=Math.atan2(wp.y-W.carY,wp.x-W.carX)*180/Math.PI;
+  return normDeg(targetDeg-W.ang*180/Math.PI);
 }
 
 function applyFrame(W, d){
-  let dist = (d.dL!==undefined?d.dL:0) * 0.5 * PX_PER_CM;
+  let ticks = d.dL!==undefined ? d.dL : 0;
+  if(Math.abs(ticks)<ODOM_TICK_DEADBAND) ticks=0;
+  let dist = ticks * ODOM_CM_PER_TICK * PX_PER_CM;
   // ĐẢO DẤU dz: map trước đây hiển thị ngược trái-phải so với thực tế. Về mặt hình học, đảo dấu
   // TOÀN BỘ góc quay tích lũy từ đầu tương đương lật gương cả quỹ đạo qua trục dọc — đúng là lỗi
   // "mirror trái-phải" toàn cục (không phải lỗi cục bộ ở 1 chỗ). Nếu sau khi sửa vẫn còn ngược ở
   // 1 vài chỗ cụ thể (chứ không phải toàn bộ), khả năng cao là do chiều lắp servo cảm biến, cần
   // xem lại dấu của "(d.ang-90)" thay vì dz.
-  W.ang += (d.dz!==undefined ? -d.dz*HEADING_GAIN*(Math.PI/180.0) : -((d.gz||0)/131.0)*HEADING_GAIN*(Math.PI/180.0)*0.15);
+  let dzDeg = d.dz!==undefined ? -d.dz*HEADING_GAIN : -((d.gz||0)/131.0)*HEADING_GAIN*0.15;
+  if((d.mv===1 || d.mv===-1) && Math.abs(dzDeg)<0.9) dzDeg=0;
+  W.ang += dzDeg*(Math.PI/180.0);
   W.carX += dist*Math.cos(W.ang); W.carY += dist*Math.sin(W.ang);
   let last=W.traj[W.traj.length-1];
   if(Math.hypot(W.carX-last.x,W.carY-last.y)>2) W.traj.push({x:W.carX,y:W.carY});
@@ -344,6 +495,7 @@ function applyFrame(W, d){
     castRay(W, W.carX,W.carY, W.carX+r*Math.cos(a), W.carY+r*Math.sin(a), false);
   }
   W.prevScan={ x:W.carX, y:W.carY, ang:beamAng, dist:curDist };
+  applyManhattanCorrection(W);
 }
 
 function drawWorld(ctx, cv, W, view, bg){
@@ -361,6 +513,11 @@ function drawWorld(ctx, cv, W, view, bg){
     ctx.beginPath();
     for(const o of W.obstacleLines){ ctx.moveTo(sx(o.x1),sy(o.y1)); ctx.lineTo(sx(o.x2),sy(o.y2)); }
     ctx.stroke(); ctx.lineCap='butt';
+  }
+  if(W.plan&&W.plan.length>1){
+    ctx.save(); ctx.setLineDash([8,6]); ctx.strokeStyle='rgba(56,189,248,0.95)'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(sx(W.carX),sy(W.carY)); for(const p of W.plan) ctx.lineTo(sx(p.x),sy(p.y)); ctx.stroke();
+    ctx.restore();
   }
   if(W.traj.length>1){ ctx.strokeStyle='rgba(251,191,36,0.75)'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(sx(W.traj[0].x),sy(W.traj[0].y)); for(let p of W.traj)ctx.lineTo(sx(p.x),sy(p.y)); ctx.stroke(); }
   if(W.beam&&W.beam.dist>0){ let bx=sx(W.beam.x),by=sy(W.beam.y),ex=sx(W.beam.x+W.beam.dist*Math.cos(W.beam.ang)*PX_PER_CM),ey=sy(W.beam.y+W.beam.dist*Math.sin(W.beam.ang)*PX_PER_CM); ctx.strokeStyle='rgba(196,120,255,0.6)'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(ex,ey); ctx.stroke(); }
@@ -422,11 +579,15 @@ function connect(){
     }
     prevAst=d.ast;
     document.getElementById('tDist').innerText=(d.dist>0?d.dist.toFixed(0):'--')+' cm';
-    const sf=document.getElementById('tSafe'); if(d.safe===0){sf.innerText='vật cản';sf.className='pill off';}else{sf.innerText='an toàn';sf.className='pill';}
+    const sf=document.getElementById('tSafe');
+    if(d.irf===1){sf.innerText='IR trước';sf.className='pill off';}
+    else if(d.rear===1){sf.innerText='IR sau';sf.className='pill off';}
+    else if(d.safe===0){sf.innerText='vật cản';sf.className='pill off';}
+    else{sf.innerText='an toàn';sf.className='pill';}
     if(d.auto!==undefined && !!d.auto!==autoOn) setAutoUI(d.auto===1);
     let mvTxt = d.mv===1?'tiến':d.mv===-1?'lùi':'—';
     if(d.auto && d.ast!==undefined){
-      const A=['đi thẳng','ngó trái','ngó phải','quyết định','lùi','rẽ','quét map','canh hướng'];
+      const A=['đi thẳng','ngó trái','ngó phải','quyết định','lùi','rẽ','quét map','canh hướng','kẹt/chờ'];
       mvTxt=A[d.ast]||'—';
     }
     document.getElementById('tMove').innerText=mvTxt;
@@ -460,7 +621,7 @@ document.getElementById('liveSaveMap').onclick=async()=>{
   const name=prompt('Tên map:', 'Map '+new Date().toLocaleString());
   if(!name) return;
   const cells=Array.from(liveW.grid.entries()).map(([k,l])=>{let i=k.indexOf(',');return [+k.slice(0,i),+k.slice(i+1),Math.round(l*100)/100];});
-  await fetch('/api/maps',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name, data:{cells, traj:liveW.traj, obstacleLines:liveW.obstacleLines}})});
+  await fetch('/api/maps',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name, data:{cells, traj:liveW.traj, obstacleLines:liveW.obstacleLines, manhattanTotal:liveW.manhattanTotal||0, wallConfidence:liveW.wallConfidence||0}})});
   alert('Đã lưu map "'+name+'" vào kho.');
 };
 
@@ -533,7 +694,7 @@ async function loadMaps(){
   }catch(e){ list.innerHTML='<div class="empty">Không tải được.</div>'; }
 }
 function gridFromCells(cells){ const W=newWorld(); (cells||[]).forEach(([cx,cy,l])=>W.grid.set(cx+','+cy,l)); return W; }
-function worldFromMapData(data){ const W=gridFromCells(data&&data.cells); if(data&&data.traj) W.traj=data.traj; if(data&&data.obstacleLines) W.obstacleLines=data.obstacleLines; return W; }
+function worldFromMapData(data){ const W=gridFromCells(data&&data.cells); if(data&&data.traj) W.traj=data.traj; if(data&&data.obstacleLines) W.obstacleLines=data.obstacleLines; if(data&&data.manhattanTotal) W.manhattanTotal=data.manhattanTotal; if(data&&data.wallConfidence) W.wallConfidence=data.wallConfidence; return W; }
 async function showMap(id){
   const m=await (await fetch('/api/maps/'+id)).json();
   mpW=worldFromMapData(m.data);
