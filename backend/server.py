@@ -1,235 +1,332 @@
-"""
-SLAM ROBOT - SERVER TRUNG TÂM (FastAPI)
-=======================================
-Tách web khỏi robot để có thể:
-  - Public ra internet (qua tunnel hoặc cloud) -> điện thoại dùng từ bất cứ đâu
-  - Dùng được KHI KHÔNG có robot: xem lại phiên chạy cũ, nạp/lưu map
-
-Endpoint:
-  WS  /ws/robot       <- robot ESP32 (STA client) gửi telemetry / nhận lệnh
-  WS  /ws/dashboard   <- trình duyệt: nhận telemetry trực tiếp / gửi lệnh
-  GET /api/sessions             danh sách phiên đã ghi
-  GET /api/sessions/{id}        dữ liệu 1 phiên (để xem lại)
-  DEL /api/sessions/{id}        xoá phiên
-  GET /api/maps                 danh sách map đã lưu
-  POST /api/maps                lưu 1 map (JSON tuỳ frontend)
-  GET /api/maps/{id}            nạp 1 map
-  DEL /api/maps/{id}            xoá map
-  /                             phục vụ frontend
-
-Chạy:  uvicorn server:app --host 0.0.0.0 --port 8000
-"""
 from __future__ import annotations
-import json, os, time, uuid, asyncio
-from typing import Optional, Set, Dict, List
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+
+import json
+import os
+import re
+import secrets
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-
-BASE = os.path.dirname(__file__)
-DATA = os.path.join(BASE, "data")
-SES_DIR = os.path.join(DATA, "sessions")
-MAP_DIR = os.path.join(DATA, "maps")
-os.makedirs(SES_DIR, exist_ok=True)
-os.makedirs(MAP_DIR, exist_ok=True)
-
-app = FastAPI(title="SLAM Robot Server")
 
 
-class Hub:
-    def __init__(self):
-        self.robot: Optional[WebSocket] = None
-        self.dashboards: Set[WebSocket] = set()
-        # ghi phiên
-        self.recording: List[dict] = []
-        self.session_start: float = 0.0
-        self.last_frame_t: float = 0.0
+ROOT = Path(__file__).resolve().parent
+PROJECT_DIR = ROOT.parent
+FRONTEND_INDEX = PROJECT_DIR / "frontend" / "index.html"
 
-    def robot_online(self) -> bool:
-        return self.robot is not None
+DATA_DIR = ROOT / "data"
+SESSIONS_DIR = DATA_DIR / "sessions"
+MAPS_DIR = DATA_DIR / "maps"
 
-HUB = Hub()
-MAX_FRAMES = 20000          # giới hạn 1 phiên (~ vài chục phút ở 7 khung/s)
-MIN_FRAMES_TO_SAVE = 15     # phiên quá ngắn thì bỏ
+for d in (SESSIONS_DIR, MAPS_DIR):
+    d.mkdir(parents=True, exist_ok=True)
 
 
-def _save_session():
-    """Lưu phiên đang ghi xuống file rồi xoá bộ đệm."""
-    if len(HUB.recording) >= MIN_FRAMES_TO_SAVE:
-        sid = time.strftime("%Y%m%d-%H%M%S", time.localtime(HUB.session_start))
-        meta = {
-            "id": sid,
-            "start": HUB.session_start,
-            "end": time.time(),
-            "duration_s": round(time.time() - HUB.session_start, 1),
-            "frames": HUB.recording,
-        }
-        try:
-            with open(os.path.join(SES_DIR, sid + ".json"), "w") as f:
-                json.dump(meta, f)
-            print("[session] đã lưu", sid, "(", len(HUB.recording), "khung )")
-        except Exception as e:
-            print("[session] lỗi lưu:", e)
-    HUB.recording = []
-    HUB.session_start = 0.0
+app = FastAPI(title="ESP32 SLAM Robot Backend")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-async def broadcast(payload: dict):
-    if not HUB.dashboards:
-        return
-    text = json.dumps(payload)
+dashboard_clients: set[WebSocket] = set()
+robot_client: Optional[WebSocket] = None
+ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def dumps(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+
+def read_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def safe_id(value: str) -> str:
+    if not value or not ID_RE.match(value):
+        raise HTTPException(status_code=404, detail="Not found")
+    return value
+
+
+def new_session_id() -> str:
+    base = datetime.now().strftime("%Y%m%d-%H%M%S")
+    sid = base
+    i = 1
+    while (SESSIONS_DIR / f"{sid}.json").exists():
+        sid = f"{base}-{i}"
+        i += 1
+    return sid
+
+
+def new_map_id() -> str:
+    while True:
+        mid = secrets.token_hex(5)
+        if not (MAPS_DIR / f"{mid}.json").exists():
+            return mid
+
+
+async def ws_send_json(ws: WebSocket, data: Any) -> None:
+    await ws.send_text(dumps(data))
+
+
+async def broadcast(data: Any) -> None:
+    msg = dumps(data)
     dead = []
-    for ws in HUB.dashboards:
+    for ws in list(dashboard_clients):
         try:
-            await ws.send_text(text)
+            await ws.send_text(msg)
         except Exception:
             dead.append(ws)
     for ws in dead:
-        HUB.dashboards.discard(ws)
+        dashboard_clients.discard(ws)
 
 
-# ---------------- WebSocket: ROBOT ----------------
-@app.websocket("/ws/robot")
-async def ws_robot(ws: WebSocket):
+async def broadcast_robot_status() -> None:
+    await broadcast({"type": "robot_status", "online": robot_client is not None})
+
+
+def save_session(
+    sid: str,
+    start_epoch: float,
+    start_mono: float,
+    frames: list[dict[str, Any]],
+) -> None:
+    if not frames:
+        return
+    data = {
+        "id": sid,
+        "start": start_epoch,
+        "end": time.time(),
+        "duration_s": round(time.monotonic() - start_mono, 1),
+        "frames": frames,
+    }
+    write_json(SESSIONS_DIR / f"{sid}.json", data)
+
+
+@app.get("/")
+async def index():
+    if not FRONTEND_INDEX.exists():
+        raise HTTPException(status_code=404, detail="frontend/index.html not found")
+    return FileResponse(FRONTEND_INDEX)
+
+
+@app.get("/index.html")
+async def index_html():
+    return await index()
+
+
+@app.websocket("/ws/dashboard")
+async def dashboard_ws(ws: WebSocket):
+    global robot_client
+
     await ws.accept()
-    HUB.robot = ws
-    HUB.session_start = time.time()
-    HUB.recording = []
-    print("[robot] online — bắt đầu ghi phiên")
-    await broadcast({"type": "robot_status", "online": True})
+    dashboard_clients.add(ws)
+    await ws_send_json(ws, {"type": "robot_status", "online": robot_client is not None})
+
     try:
         while True:
-            raw = await ws.receive_text()
+            command_text = await ws.receive_text()
+            target = robot_client
+
+            if target is None:
+                await ws_send_json(ws, {"type": "robot_status", "online": False})
+                continue
+
             try:
-                data = json.loads(raw)
+                await target.send_text(command_text)
+            except Exception:
+                if robot_client is target:
+                    robot_client = None
+                await broadcast_robot_status()
+
+    except WebSocketDisconnect:
+        pass
+    finally:
+        dashboard_clients.discard(ws)
+
+
+@app.websocket("/ws/robot")
+async def robot_ws(ws: WebSocket):
+    global robot_client
+
+    await ws.accept()
+
+    old_robot = robot_client
+    if old_robot is not None and old_robot is not ws:
+        try:
+            await old_robot.close(code=1012)
+        except Exception:
+            pass
+
+    robot_client = ws
+    await broadcast_robot_status()
+
+    sid = new_session_id()
+    start_epoch = time.time()
+    start_mono = time.monotonic()
+    frames: list[dict[str, Any]] = []
+
+    try:
+        while True:
+            text = await ws.receive_text()
+
+            try:
+                frame = json.loads(text)
             except json.JSONDecodeError:
                 continue
-            # ghi khung (kèm timestamp tương đối ms)
-            data["_t"] = int((time.time() - HUB.session_start) * 1000)
-            if len(HUB.recording) < MAX_FRAMES:
-                HUB.recording.append(data)
-            # chuyển tiếp cho dashboard (gắn nhãn live)
-            await broadcast({"type": "telemetry", "data": data})
+
+            if not isinstance(frame, dict):
+                continue
+
+            frame["_t"] = int((time.monotonic() - start_mono) * 1000)
+            frames.append(frame)
+
+            await broadcast({"type": "telemetry", "data": frame})
+
+            if len(frames) % 25 == 0:
+                save_session(sid, start_epoch, start_mono, frames)
+
     except WebSocketDisconnect:
         pass
     finally:
-        HUB.robot = None
-        _save_session()
-        print("[robot] offline — đã lưu phiên")
-        await broadcast({"type": "robot_status", "online": False})
+        if robot_client is ws:
+            robot_client = None
+        save_session(sid, start_epoch, start_mono, frames)
+        await broadcast_robot_status()
 
 
-# ---------------- WebSocket: DASHBOARD ----------------
-@app.websocket("/ws/dashboard")
-async def ws_dashboard(ws: WebSocket):
-    await ws.accept()
-    HUB.dashboards.add(ws)
-    await ws.send_text(json.dumps({"type": "robot_status", "online": HUB.robot_online()}))
-    try:
-        while True:
-            raw = await ws.receive_text()
-            # lệnh điều khiển -> chuyển nguyên văn xuống robot (cùng định dạng cũ)
-            if HUB.robot is not None:
-                try:
-                    await HUB.robot.send_text(raw)
-                except Exception:
-                    pass
-    except WebSocketDisconnect:
-        pass
-    finally:
-        HUB.dashboards.discard(ws)
-
-
-# ---------------- REST: SESSIONS ----------------
 @app.get("/api/sessions")
 async def list_sessions():
-    out = []
-    for fn in sorted(os.listdir(SES_DIR), reverse=True):
-        if not fn.endswith(".json"):
+    rows = []
+
+    for path in sorted(SESSIONS_DIR.glob("*.json"), reverse=True):
+        data = read_json(path)
+        if not isinstance(data, dict):
             continue
-        try:
-            with open(os.path.join(SES_DIR, fn)) as f:
-                m = json.load(f)
-            out.append({"id": m["id"], "start": m["start"],
-                        "duration_s": m.get("duration_s", 0),
-                        "frames": len(m.get("frames", []))})
-        except Exception:
-            continue
-    return out
+
+        frames = data.get("frames") or []
+        rows.append(
+            {
+                "id": data.get("id") or path.stem,
+                "start": data.get("start"),
+                "end": data.get("end"),
+                "duration_s": data.get("duration_s", 0),
+                "frames": len(frames) if isinstance(frames, list) else 0,
+            }
+        )
+
+    return JSONResponse(rows)
 
 
-@app.get("/api/sessions/{sid}")
-async def get_session(sid: str):
-    path = os.path.join(SES_DIR, sid + ".json")
-    if not os.path.isfile(path):
-        raise HTTPException(404, "Không tìm thấy phiên")
-    with open(path) as f:
-        return json.load(f)
+@app.get("/api/sessions/{session_id}")
+async def get_session(session_id: str):
+    sid = safe_id(session_id)
+    path = SESSIONS_DIR / f"{sid}.json"
+
+    data = read_json(path)
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    return JSONResponse(data)
 
 
-@app.delete("/api/sessions/{sid}")
-async def del_session(sid: str):
-    path = os.path.join(SES_DIR, sid + ".json")
-    if os.path.isfile(path):
-        os.remove(path)
+@app.delete("/api/sessions/{session_id}")
+async def delete_session(session_id: str):
+    sid = safe_id(session_id)
+    path = SESSIONS_DIR / f"{sid}.json"
+
+    if path.exists():
+        path.unlink()
+
     return {"ok": True}
 
 
-# ---------------- REST: MAPS ----------------
 @app.get("/api/maps")
 async def list_maps():
-    out = []
-    for fn in sorted(os.listdir(MAP_DIR), reverse=True):
-        if not fn.endswith(".json"):
+    rows = []
+
+    for path in MAPS_DIR.glob("*.json"):
+        data = read_json(path)
+        if not isinstance(data, dict):
             continue
-        try:
-            with open(os.path.join(MAP_DIR, fn)) as f:
-                m = json.load(f)
-            out.append({"id": m["id"], "name": m.get("name", m["id"]),
-                        "created": m.get("created", 0)})
-        except Exception:
-            continue
-    return out
+
+        rows.append(
+            {
+                "id": data.get("id") or path.stem,
+                "name": data.get("name") or path.stem,
+                "created": data.get("created", 0),
+            }
+        )
+
+    rows.sort(key=lambda row: row.get("created") or 0, reverse=True)
+    return JSONResponse(rows)
 
 
 @app.post("/api/maps")
-async def save_map(payload: dict):
-    mid = uuid.uuid4().hex[:10]
-    rec = {"id": mid, "name": payload.get("name", "map"),
-           "created": time.time(), "data": payload.get("data", {})}
-    with open(os.path.join(MAP_DIR, mid + ".json"), "w") as f:
-        json.dump(rec, f)
-    return {"ok": True, "id": mid}
+async def create_map(payload: dict[str, Any] = Body(...)):
+    name = str(payload.get("name") or "Map").strip() or "Map"
+    data = payload.get("data") or {}
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="data must be an object")
+
+    mid = new_map_id()
+    item = {
+        "id": mid,
+        "name": name,
+        "created": time.time(),
+        "data": data,
+    }
+
+    write_json(MAPS_DIR / f"{mid}.json", item)
+    return JSONResponse(item)
 
 
-@app.get("/api/maps/{mid}")
-async def get_map(mid: str):
-    path = os.path.join(MAP_DIR, mid + ".json")
-    if not os.path.isfile(path):
-        raise HTTPException(404, "Không tìm thấy map")
-    with open(path) as f:
-        return json.load(f)
+@app.get("/api/maps/{map_id}")
+async def get_map(map_id: str):
+    mid = safe_id(map_id)
+    path = MAPS_DIR / f"{mid}.json"
+
+    data = read_json(path)
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=404, detail="Map not found")
+
+    return JSONResponse(data)
 
 
-@app.delete("/api/maps/{mid}")
-async def del_map(mid: str):
-    path = os.path.join(MAP_DIR, mid + ".json")
-    if os.path.isfile(path):
-        os.remove(path)
+@app.delete("/api/maps/{map_id}")
+async def delete_map(map_id: str):
+    mid = safe_id(map_id)
+    path = MAPS_DIR / f"{mid}.json"
+
+    if path.exists():
+        path.unlink()
+
     return {"ok": True}
 
 
-@app.get("/api/status")
-async def status():
-    return {"robot_online": HUB.robot_online(),
-            "dashboards": len(HUB.dashboards),
-            "recording_frames": len(HUB.recording)}
-
-
-# ---------------- Phục vụ frontend ----------------
-FE = os.path.join(BASE, "..", "frontend")
-if os.path.isdir(FE):
-    @app.get("/")
-    async def index():
-        return FileResponse(os.path.join(FE, "index.html"))
-    app.mount("/static", StaticFiles(directory=FE), name="static")
+@app.get("/health")
+async def health():
+    return {
+        "ok": True,
+        "robot_online": robot_client is not None,
+        "dashboards": len(dashboard_clients),
+    }

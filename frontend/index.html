@@ -77,8 +77,8 @@
       </div>
     </div>
     <div class="card">
-      <div class="slabel"><span>Tốc độ</span><b id="spdVal">30</b></div>
-      <input type="range" min="30" max="40" value="30" id="spd">
+      <div class="slabel"><span>Tốc độ</span><b id="spdVal">70</b></div>
+      <input type="range" min="30" max="90" value="70" id="spd">
       <label style="display:flex; align-items:center; gap:8px; margin-top:10px; font-size:13px; color:var(--mut);">
         <input type="checkbox" id="exploreChk" style="width:16px; height:16px;">
         🧭 Khám phá thông minh (web gợi ý hướng dựa vào bản đồ, chỉ hoạt động khi AUTO bật)
@@ -118,7 +118,7 @@
 const PX_PER_CM = 1.5, CELL = 5, L_OCC=0.8, L_FREE=-0.35, L_MIN=-4, L_MAX=4;
 const FREE_FILL='#c7dbd3';
 const BEAM_HALF_FOV = 0.10;
-const OBSTACLE_DETECT_CM = 30;   // <=30cm mới xác định là vật chắn
+const OBSTACLE_DETECT_CM = 40;   // <=40cm mới xác định là vật chắn
 const SENSOR_DRAW_MAX_CM = 160;
 const FREE_RAY_CM = 30;          // xa hơn 30cm thì chỉ vẽ vùng trống phía trước
 const OBSTACLE_LINE_CM = 12;      // chiều dài vết gạch vật cản: nhỏ, giống line đường đi
@@ -128,12 +128,16 @@ const ODOM_TICK_DEADBAND = 1.2;    // bỏ qua tick rất nhỏ do rung/giật n
 const ROBOT_RADIUS_CM = 12;
 const FRONTIER_MAX_CM = 360;
 const FRONTIER_STEP_CELLS = 10;
+const WAYPOINT_LOOKAHEAD_CELLS = 9;
+const FRONTIER_BAD_MS = 9000;
+const PLAN_CANDIDATES_MAX = 80;
+const PLANNER_MAX_EXPAND = 4500;
 const INFLATE_CELLS = Math.max(1, Math.ceil((ROBOT_RADIUS_CM*PX_PER_CM)/CELL));
 const MANHATTAN_MIN_LINES = 12;
 const MANHATTAN_MIN_OCC_CELLS = 24;
 const MANHATTAN_MAX_STEP = Math.PI/180*1.2;
 
-function newWorld(){ return { grid:new Map(), carX:0, carY:0, ang:-Math.PI/2, traj:[{x:0,y:0}], beam:null, prevScan:null, obstacleLines:[], plan:[], frameSeq:0, lastSnapFrame:0, manhattanTotal:0, wallSkew:0, wallConfidence:0 }; }
+function newWorld(){ return { grid:new Map(), carX:0, carY:0, ang:-Math.PI/2, traj:[{x:0,y:0}], beam:null, prevScan:null, obstacleLines:[], plan:[], planTarget:null, nextWaypoint:null, plannerBad:new Map(), frameSeq:0, lastSnapFrame:0, manhattanTotal:0, wallSkew:0, wallConfidence:0 }; }
 function updateCell(W, cx, cy, d){ let k=cx+','+cy; let v=(W.grid.get(k)||0)+d; W.grid.set(k, Math.max(L_MIN,Math.min(L_MAX,v))); }
 const OCC_SOLID=1.5;
 const OCC_BLOCK=0.65;
@@ -211,6 +215,8 @@ function rotateWorld(W, da){
   W.carX=car.x; W.carY=car.y; W.ang=normRad(W.ang+da);
   W.traj.forEach(p=>rotateObj(p,c,s));
   W.plan.forEach(p=>rotateObj(p,c,s));
+  if(W.planTarget) rotateObj(W.planTarget,c,s);
+  if(W.nextWaypoint) rotateObj(W.nextWaypoint,c,s);
   if(W.beam){ rotateObj(W.beam,c,s); W.beam.ang=normRad(W.beam.ang+da); }
   if(W.prevScan){ rotateObj(W.prevScan,c,s); W.prevScan.ang=normRad(W.prevScan.ang+da); }
   for(const o of W.obstacleLines){
@@ -383,65 +389,146 @@ function drawFreeSmooth(ctx, W, sx, sy, z, alpha){
 // (chưa từng quét tới) trước khi chạm tường hoặc hết tầm coi là 1 "frontier" (ranh giới đã biết/
 // chưa biết) -- đây chính là hướng đáng đi tới để mở rộng bản đồ. Chọn frontier GẦN NHẤT.
 function normDeg(d){ while(d>180)d-=360; while(d<-180)d+=360; return d; }
-function computeExploreRelDeg(W){
-  const maxCells=Math.ceil((FRONTIER_MAX_CM*PX_PER_CM)/CELL);
-  const sx0=Math.floor(W.carX/CELL), sy0=Math.floor(W.carY/CELL);
-  const key=(x,y)=>x+','+y, start=key(sx0,sy0);
+function cellKey(x,y){ return x+','+y; }
+function parseCellKey(k){ const i=k.indexOf(','); return {x:+k.slice(0,i), y:+k.slice(i+1)}; }
+function cellCenter(c){ return {x:(c.x+0.5)*CELL, y:(c.y+0.5)*CELL}; }
+function plannerNow(){ return (typeof performance!=='undefined' && performance.now) ? performance.now() : Date.now(); }
+
+function buildPlanner(W){
+  if(!W.plannerBad) W.plannerBad=new Map();
+  const now=plannerNow();
+  W.plannerBad.forEach((until,k)=>{ if(until<=now) W.plannerBad.delete(k); });
+  const sx=Math.floor(W.carX/CELL), sy=Math.floor(W.carY/CELL), start={x:sx,y:sy};
+  const startKey=cellKey(sx,sy);
+  if(!W.grid.has(startKey)) W.grid.set(startKey, L_FREE);
   const blocked=new Set();
   W.grid.forEach((l,k)=>{
     if(l<OCC_BLOCK) return;
-    const i=k.indexOf(','), cx=+k.slice(0,i), cy=+k.slice(i+1);
+    const c=parseCellKey(k);
     for(let oy=-INFLATE_CELLS;oy<=INFLATE_CELLS;oy++) for(let ox=-INFLATE_CELLS;ox<=INFLATE_CELLS;ox++){
-      if(ox*ox+oy*oy<=INFLATE_CELLS*INFLATE_CELLS) blocked.add(key(cx+ox,cy+oy));
+      if(ox*ox+oy*oy<=INFLATE_CELLS*INFLATE_CELLS) blocked.add(cellKey(c.x+ox,c.y+oy));
     }
   });
-  const isKnownFree=(x,y)=>{
-    const l=W.grid.get(key(x,y));
-    return l!==undefined && l<OCC_BLOCK && !blocked.has(key(x,y));
+  for(let oy=-1;oy<=1;oy++) for(let ox=-1;ox<=1;ox++) blocked.delete(cellKey(sx+ox,sy+oy));
+  const isWalkable=(x,y)=>{
+    const k=cellKey(x,y), l=W.grid.get(k);
+    return l!==undefined && l<OCC_BLOCK && !blocked.has(k);
   };
-  if(!isKnownFree(sx0,sy0)) blocked.delete(start);
-  const hasUnknownNeighbor=(x,y)=>{
-    let unknown=0;
+  const unknownCount=(x,y)=>{
+    let n=0;
     for(let oy=-1;oy<=1;oy++) for(let ox=-1;ox<=1;ox++){
       if(ox===0&&oy===0) continue;
-      const k=key(x+ox,y+oy);
-      if(!blocked.has(k) && W.grid.get(k)===undefined) unknown++;
+      const k=cellKey(x+ox,y+oy);
+      if(!blocked.has(k) && W.grid.get(k)===undefined) n++;
     }
-    return unknown>=3;
+    return n;
   };
-  const dirs=[[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
-  const q=[{x:sx0,y:sy0,d:0}], seen=new Set([start]), parent=new Map();
-  let best=null;
-  for(let qi=0;qi<q.length;qi++){
-    const n=q[qi];
-    if(n.d>maxCells) break;
-    if(n.d>INFLATE_CELLS+2 && hasUnknownNeighbor(n.x,n.y)){
-      const dx=(n.x+0.5)*CELL-W.carX, dy=(n.y+0.5)*CELL-W.carY;
-      const rel=Math.abs(normDeg(Math.atan2(dy,dx)*180/Math.PI-W.ang*180/Math.PI));
-      const score=n.d+rel*0.04;
-      if(!best || score<best.score) best={...n,score};
+  return {start, startKey, blocked, isWalkable, unknownCount, maxCells:Math.ceil((FRONTIER_MAX_CM*PX_PER_CM)/CELL)};
+}
+
+function findFrontierCandidates(W,P){
+  const out=[];
+  W.grid.forEach((l,k)=>{
+    if(l===undefined || l>=OCC_BLOCK || P.blocked.has(k) || W.plannerBad.has(k)) return;
+    const c=parseCellKey(k);
+    const dx=c.x-P.start.x, dy=c.y-P.start.y;
+    const distCells=Math.hypot(dx,dy);
+    if(distCells<INFLATE_CELLS+2 || distCells>P.maxCells) return;
+    const unknown=P.unknownCount(c.x,c.y);
+    if(unknown<3) return;
+    const wp=cellCenter(c);
+    const rel=Math.abs(normDeg(Math.atan2(wp.y-W.carY,wp.x-W.carX)*180/Math.PI-W.ang*180/Math.PI));
+    out.push({x:c.x,y:c.y,k,unknown,distCells,score:distCells+rel*0.06-unknown*0.8});
+  });
+  out.sort((a,b)=>a.score-b.score);
+  return out.slice(0,PLAN_CANDIDATES_MAX);
+}
+
+function astarPath(P,target){
+  const start=P.start, startKey=P.startKey, targetKey=cellKey(target.x,target.y);
+  if(startKey===targetKey) return [start];
+  if(!P.isWalkable(target.x,target.y)) return null;
+  const dirs=[[1,0],[-1,0],[0,1],[0,-1]];
+  const open=[{x:start.x,y:start.y,k:startKey,f:0}], openKeys=new Set([startKey]);
+  const came=new Map(), g=new Map([[startKey,0]]);
+  const h=(x,y)=>Math.abs(x-target.x)+Math.abs(y-target.y);
+  let expanded=0;
+  while(open.length && expanded++<PLANNER_MAX_EXPAND){
+    let bestI=0;
+    for(let i=1;i<open.length;i++) if(open[i].f<open[bestI].f) bestI=i;
+    const cur=open.splice(bestI,1)[0];
+    openKeys.delete(cur.k);
+    if(cur.k===targetKey){
+      const path=[];
+      let k=cur.k;
+      while(k){
+        path.push(parseCellKey(k));
+        if(k===startKey) break;
+        k=came.get(k);
+      }
+      return path.reverse();
     }
+    const base=g.get(cur.k)||0;
     for(const [ox,oy] of dirs){
-      const nx=n.x+ox, ny=n.y+oy, nk=key(nx,ny);
-      if(seen.has(nk) || !isKnownFree(nx,ny)) continue;
-      if(ox&&oy && (!isKnownFree(n.x+ox,n.y) || !isKnownFree(n.x,n.y+oy))) continue;
-      seen.add(nk); parent.set(nk,key(n.x,n.y)); q.push({x:nx,y:ny,d:n.d+1});
+      const nx=cur.x+ox, ny=cur.y+oy, nk=cellKey(nx,ny);
+      if(!P.isWalkable(nx,ny)) continue;
+      const ng=base+1;
+      if(!g.has(nk) || ng<g.get(nk)){
+        came.set(nk,cur.k); g.set(nk,ng);
+        const f=ng+h(nx,ny);
+        if(!openKeys.has(nk)){ open.push({x:nx,y:ny,k:nk,f}); openKeys.add(nk); }
+      }
     }
   }
-  if(!best){ W.plan=[]; return null; }
-  const path=[];
-  let cur=key(best.x,best.y);
-  while(cur && cur!==start){
-    const i=cur.indexOf(','), cx=+cur.slice(0,i), cy=+cur.slice(i+1);
-    path.push({x:(cx+0.5)*CELL,y:(cy+0.5)*CELL});
-    cur=parent.get(cur);
+  return null;
+}
+
+function pickWaypointCell(path){
+  if(!path || path.length<2) return null;
+  const maxI=Math.min(WAYPOINT_LOOKAHEAD_CELLS, path.length-1);
+  let lastDx=path[1].x-path[0].x, lastDy=path[1].y-path[0].y;
+  for(let i=2;i<=maxI;i++){
+    const dx=path[i].x-path[i-1].x, dy=path[i].y-path[i-1].y;
+    if(dx!==lastDx || dy!==lastDy) return path[i-1];
   }
-  path.reverse();
-  W.plan=path;
-  const wp=path[Math.min(FRONTIER_STEP_CELLS,path.length-1)]||path[path.length-1];
-  if(!wp) return null;
-  const targetDeg=Math.atan2(wp.y-W.carY,wp.x-W.carX)*180/Math.PI;
-  return normDeg(targetDeg-W.ang*180/Math.PI);
+  return path[maxI];
+}
+
+function computeExploreWaypoint(W){
+  const P=buildPlanner(W);
+  const candidates=findFrontierCandidates(W,P);
+  if(!candidates.length){
+    W.plan=[]; W.planTarget=null; W.nextWaypoint=null;
+    return null;
+  }
+  for(const cand of candidates){
+    const path=astarPath(P,cand);
+    if(!path || path.length<2){
+      W.plannerBad.set(cand.k, plannerNow()+FRONTIER_BAD_MS);
+      continue;
+    }
+    const wpCell=pickWaypointCell(path);
+    if(!wpCell) continue;
+    const wp=cellCenter(wpCell), target=cellCenter(cand);
+    W.plan=path.slice(1).map(cellCenter);
+    W.nextWaypoint=wp;
+    W.planTarget=target;
+    const targetDeg=Math.atan2(wp.y-W.carY,wp.x-W.carX)*180/Math.PI;
+    const distCm=Math.hypot(wp.x-W.carX,wp.y-W.carY)/PX_PER_CM;
+    return {
+      rel_deg:normDeg(targetDeg-W.ang*180/Math.PI),
+      dist_cm:Math.max(6,Math.min(85,distCm)),
+      target_key:cand.k,
+      path_cells:path.length
+    };
+  }
+  W.plan=[]; W.planTarget=null; W.nextWaypoint=null;
+  return null;
+}
+
+function computeExploreRelDeg(W){
+  const wp=computeExploreWaypoint(W);
+  return wp ? wp.rel_deg : null;
 }
 
 function applyFrame(W, d){
@@ -519,6 +606,15 @@ function drawWorld(ctx, cv, W, view, bg){
     ctx.beginPath(); ctx.moveTo(sx(W.carX),sy(W.carY)); for(const p of W.plan) ctx.lineTo(sx(p.x),sy(p.y)); ctx.stroke();
     ctx.restore();
   }
+  if(W.planTarget){
+    ctx.fillStyle='rgba(14,165,233,0.95)';
+    ctx.beginPath(); ctx.arc(sx(W.planTarget.x),sy(W.planTarget.y),5,0,6.28); ctx.fill();
+  }
+  if(W.nextWaypoint){
+    ctx.fillStyle='rgba(34,211,238,0.95)';
+    ctx.strokeStyle='rgba(8,47,73,0.9)'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.arc(sx(W.nextWaypoint.x),sy(W.nextWaypoint.y),7,0,6.28); ctx.fill(); ctx.stroke();
+  }
   if(W.traj.length>1){ ctx.strokeStyle='rgba(251,191,36,0.75)'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(sx(W.traj[0].x),sy(W.traj[0].y)); for(let p of W.traj)ctx.lineTo(sx(p.x),sy(p.y)); ctx.stroke(); }
   if(W.beam&&W.beam.dist>0){ let bx=sx(W.beam.x),by=sy(W.beam.y),ex=sx(W.beam.x+W.beam.dist*Math.cos(W.beam.ang)*PX_PER_CM),ey=sy(W.beam.y+W.beam.dist*Math.sin(W.beam.ang)*PX_PER_CM); ctx.strokeStyle='rgba(196,120,255,0.6)'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(bx,by); ctx.lineTo(ex,ey); ctx.stroke(); }
   let rx=sx(W.carX),ry=sy(W.carY);
@@ -572,10 +668,10 @@ function connect(){
     applyFrame(liveW,d);
     // KHÁM PHÁ THÔNG MINH: đúng lúc robot VỪA chuyển sang trạng thái "quét map" (ast=6, cạnh lên
     // từ giá trị khác), tính hướng khám phá từ bản đồ hiện có và gửi xuống robot -- kịp trước khi
-    // robot quét xong (SCAN_MS~1.7s) và quyết định có canh hướng hay không.
+    // robot quét xong và quyết định có canh hướng hay không.
     if(document.getElementById('exploreChk').checked && d.ast===6 && prevAst!==6){
-      const rel=computeExploreRelDeg(liveW);
-      if(rel!==null) send({cmd:'goto', rel_deg: Math.round(rel*10)/10});
+      const wp=computeExploreWaypoint(liveW);
+      if(wp) send({cmd:'waypoint', rel_deg: Math.round(wp.rel_deg*10)/10, dist_cm: Math.round(wp.dist_cm)});
     }
     prevAst=d.ast;
     document.getElementById('tDist').innerText=(d.dist>0?d.dist.toFixed(0):'--')+' cm';
